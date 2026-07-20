@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Crypto Bot Dashboard</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+  :root {
+    --bg: #0b0d12;
+    --card: #151922;
+    --border: #262b36;
+    --text: #e8eaed;
+    --muted: #8b92a3;
+    --green: #3ecf8e;
+    --red: #f2495c;
+    --amber: #f2b84b;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    padding: 24px 16px 60px;
+  }
+  h1 {
+    font-size: 20px;
+    margin: 0 0 4px;
+  }
+  .subtitle {
+    color: var(--muted);
+    font-size: 13px;
+    margin-bottom: 24px;
+  }
+  .section-title {
+    font-size: 14px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--muted);
+    margin: 32px 0 12px;
+  }
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+    gap: 12px;
+  }
+  .card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 14px 16px;
+  }
+  .card .coin {
+    font-weight: 600;
+    font-size: 15px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+  .badge {
+    font-size: 11px;
+    padding: 2px 8px;
+    border-radius: 999px;
+    font-weight: 600;
+  }
+  .badge.enabled { background: rgba(62,207,142,0.15); color: var(--green); }
+  .badge.disabled { background: rgba(139,146,163,0.15); color: var(--muted); }
+  .card .row {
+    display: flex;
+    justify-content: space-between;
+    font-size: 13px;
+    color: var(--muted);
+    margin-top: 6px;
+  }
+  .card .row span:last-child { color: var(--text); }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+  }
+  th, td {
+    text-align: left;
+    padding: 10px 8px;
+    border-bottom: 1px solid var(--border);
+    white-space: nowrap;
+  }
+  th {
+    color: var(--muted);
+    font-weight: 500;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+  }
+  .status-success { color: var(--green); font-weight: 600; }
+  .status-error { color: var(--red); font-weight: 600; }
+  .empty {
+    color: var(--muted);
+    font-size: 13px;
+    padding: 24px 0;
+    text-align: center;
+  }
+  .table-wrap {
+    overflow-x: auto;
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+  }
+  #error-banner {
+    display: none;
+    background: rgba(242,73,92,0.12);
+    border: 1px solid rgba(242,73,92,0.4);
+    color: var(--red);
+    padding: 12px 16px;
+    border-radius: 8px;
+    font-size: 13px;
+    margin-bottom: 20px;
+  }
+  .refresh-note {
+    color: var(--muted);
+    font-size: 12px;
+    margin-top: 24px;
+    text-align: center;
+  }
+</style>
+</head>
+<body>
+
+<h1>Crypto Trailing-Stop Bot</h1>
+<div class="subtitle">Live view of tracked positions and trade history</div>
+
+<div id="error-banner"></div>
+
+<div class="section-title">Tracked positions</div>
+<div id="positions" class="grid">
+  <div class="empty">Loading…</div>
+</div>
+
+<div class="section-title">Trade history</div>
+<div class="table-wrap">
+  <table>
+    <thead>
+      <tr>
+        <th>Time</th>
+        <th>Coin</th>
+        <th>Action</th>
+        <th>Price</th>
+        <th>Peak</th>
+        <th>Amount sold</th>
+        <th>Status</th>
+        <th>Detail</th>
+      </tr>
+    </thead>
+    <tbody id="trade-rows">
+      <tr><td colspan="8" class="empty">Loading…</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="refresh-note">Refreshes automatically every 30 seconds</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<script>
+  // These are safe to expose publicly — the anon/public key, combined with
+  // the read-only RLS policies in schema.sql, only allows SELECT queries.
+  // It cannot insert, update, delete, or place trades.
+  const SUPABASE_URL = "https://enwitxdehukxdgujruhu.supabase.co";
+  const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImVud2l0eGRlaHVreGRndWpydWh1Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQ1NjIxMjEsImV4cCI6MjEwMDEzODEyMX0.DPbumyhG2Jj5wTcT5-PrLFkmc0Ecpyp6EuewcpgBujQ";
+
+  const client = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
+  function fmtMoney(n) {
+    if (n === null || n === undefined) return "—";
+    return "£" + Number(n).toLocaleString(undefined, { maximumFractionDigits: 4 });
+  }
+
+  function fmtTime(t) {
+    if (!t) return "—";
+    return new Date(t).toLocaleString();
+  }
+
+  function showError(msg) {
+    const el = document.getElementById("error-banner");
+    el.textContent = msg;
+    el.style.display = "block";
+  }
+
+  async function loadPositions() {
+    const { data, error } = await client
+      .from("positions")
+      .select("*")
+      .order("product_id", { ascending: true });
+
+    const container = document.getElementById("positions");
+
+    if (error) {
+      showError("Could not load positions: " + error.message);
+      container.innerHTML = `<div class="empty">Error loading positions</div>`;
+      return;
+    }
+
+    if (!data || data.length === 0) {
+      container.innerHTML = `<div class="empty">No positions tracked yet — run seed.js</div>`;
+      return;
+    }
+
+    container.innerHTML = data.map(p => `
+      <div class="card">
+        <div class="coin">
+          ${p.product_id}
+          <span class="badge ${p.enabled ? 'enabled' : 'disabled'}">
+            ${p.enabled ? 'Tracking' : 'Sold / Off'}
+          </span>
+        </div>
+        <div class="row"><span>Peak price</span><span>${fmtMoney(p.peak_price)}</span></div>
+        <div class="row"><span>Last price</span><span>${fmtMoney(p.last_checked_price)}</span></div>
+        <div class="row"><span>Stop level</span><span>${fmtMoney(p.peak_price * (1 - p.trailing_stop_pct / 100))}</span></div>
+        <div class="row"><span>Stop %</span><span>${p.trailing_stop_pct}%</span></div>
+        <div class="row"><span>Last checked</span><span>${fmtTime(p.last_checked_at)}</span></div>
+      </div>
+    `).join("");
+  }
+
+  async function loadTradeLog() {
+    const { data, error } = await client
+      .from("trade_log")
+      .select("*")
+      .order("created_at", { ascending: false })
+      .limit(100);
+
+    const tbody = document.getElementById("trade-rows");
+
+    if (error) {
+      showError("Could not load trade log: " + error.message);
+      tbody.innerHTML = `<tr><td colspan="8" class="empty">Error loading trade log</td></tr>`;
+      return;
+    }
+
+    if (!data || data.length === 0) {
+      tbody.innerHTML = `<tr><td colspan="8" class="empty">No trades yet — nothing has triggered a sell</td></tr>`;
+      return;
+    }
+
+    tbody.innerHTML = data.map(t => `
+      <tr>
+        <td>${fmtTime(t.created_at)}</td>
+        <td>${t.product_id}</td>
+        <td>${t.action}</td>
+        <td>${fmtMoney(t.price)}</td>
+        <td>${fmtMoney(t.peak_price)}</td>
+        <td>${t.base_size ?? "—"}</td>
+        <td class="status-${t.status}">${t.status}</td>
+        <td style="max-width:280px; white-space:normal;">${(t.detail || "").slice(0, 200)}</td>
+      </tr>
+    `).join("");
+  }
+
+  async function loadAll() {
+    document.getElementById("error-banner").style.display = "none";
+    await Promise.all([loadPositions(), loadTradeLog()]);
+  }
+
+  loadAll();
+  setInterval(loadAll, 30000);
+</script>
+
+</body>
+</html>

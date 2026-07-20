@@ -26,6 +26,66 @@ market orders can fill at worse prices during fast moves.
   purposes in the UK — keep the `trade_log` table for your records and
   talk to an accountant.
 
+## Scheduling: GitHub Actions instead of Vercel Cron
+
+Vercel's free Hobby plan only allows once-a-day cron jobs. Instead, this
+repo uses a **GitHub Actions workflow** (`.github/workflows/check.yml`)
+to call your Vercel endpoint every 5 minutes for free. Vercel still hosts
+and runs `/api/check` — GitHub Actions is just the "alarm clock" that
+calls it on a schedule.
+
+### Enabling it
+
+1. Push this repo to GitHub (if you haven't already).
+2. In the GitHub repo: Settings → Secrets and variables → Actions → **New
+   repository secret**. Add two secrets:
+   - `CHECK_ENDPOINT_URL` — your deployed endpoint, e.g.
+     `https://your-project.vercel.app/api/check`
+   - `CRON_SECRET` — the exact same value you set in Vercel's environment
+     variables
+3. That's it — GitHub will start running the workflow every 5 minutes
+   automatically. You can also trigger it manually any time from the
+   repo's **Actions** tab → "Check trailing stops" → **Run workflow**.
+
+Note: GitHub's schedule is best-effort, not exact — under heavy platform
+load it can occasionally run a few minutes late. Fine for this use case.
+
+## Dashboard
+
+`public/dashboard.html` is a simple read-only web page showing:
+- Every tracked position (peak price, last price, stop level, when last checked)
+- A full trade history table (every sell attempt, success or error, with detail)
+
+It's a static page — once you deploy it as part of this Vercel project, it's
+reachable at `https://your-project.vercel.app/dashboard.html` from your
+phone or any browser, no login needed.
+
+### Setup
+
+1. Open `public/dashboard.html` and replace these two placeholders near the
+   bottom of the file:
+   ```js
+   const SUPABASE_URL = "REPLACE_WITH_YOUR_SUPABASE_URL";
+   const SUPABASE_ANON_KEY = "REPLACE_WITH_YOUR_SUPABASE_ANON_KEY";
+   ```
+   Use your **Project URL** (same as `SUPABASE_URL` elsewhere) and the
+   **anon / public** key (NOT the service_role key — the anon key is
+   designed to be safely exposed in browser code, unlike service_role).
+   Find it in Supabase: Settings → API Keys → API Keys tab (or Legacy API
+   Keys tab, labeled `anon` `public`).
+
+2. Run the updated `schema.sql` in Supabase's SQL editor again — it now
+   also adds two read-only security policies so this page can view (but
+   never modify) your `positions` and `trade_log` tables using the public
+   key.
+
+3. Push and redeploy — the page will be live at `/dashboard.html` on your
+   existing Vercel domain.
+
+Since this uses the anon key with read-only policies, it's safe to visit
+from any device — it cannot place trades, change settings, or modify
+data, only display it.
+
 ## Setup
 
 ### 1. Coinbase API key
