@@ -13,5 +13,6 @@ jobs:
     steps:
       - name: Call /api/check on Vercel
         run: |
-          curl -sS -f -X GET "${{ secrets.CHECK_ENDPOINT_URL }}" \
-            -H "Authorization: Bearer ${{ secrets.CRON_SECRET }}"
+          curl -sS -L -X GET "${{ secrets.CHECK_ENDPOINT_URL }}" \
+            -H "Authorization: Bearer ${{ secrets.CRON_SECRET }}" \
+            -w "\nHTTP status: %{http_code}\n"
