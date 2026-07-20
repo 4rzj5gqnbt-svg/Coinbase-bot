@@ -1,0 +1,17 @@
+name: Check trailing stops
+
+on:
+  schedule:
+    # GitHub's schedule is UTC and best-effort — it can occasionally lag
+    # a few minutes under load, but averages every 5 min.
+    - cron: "*/5 * * * *"
+  workflow_dispatch: {} # lets you trigger it manually from the Actions tab too
+
+jobs:
+  call-check-endpoint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call /api/check on Vercel
+        run: |
+          curl -sS -f -X GET "${{ secrets.CHECK_ENDPOINT_URL }}" \
+            -H "Authorization: Bearer ${{ secrets.CRON_SECRET }}"
