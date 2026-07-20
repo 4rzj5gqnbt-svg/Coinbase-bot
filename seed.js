@@ -11,6 +11,15 @@ const PRODUCTS = [
   { product_id: "ETH-GBP", base_currency: "ETH" },
   { product_id: "SOL-GBP", base_currency: "SOL" },
   { product_id: "ADA-GBP", base_currency: "ADA" },
+  { product_id: "ATOM-GBP", base_currency: "ATOM" }, // Cosmos
+  { product_id: "ALGO-GBP", base_currency: "ALGO" }, // Algorand
+  { product_id: "XTZ-GBP", base_currency: "XTZ" },   // Tezos
+  // Not included:
+  // - USDS: a stablecoin, designed to stay near a fixed value — a 5%
+  //   trailing stop doesn't make sense for it.
+  // - Green Satoshi Token (GST): not listed on Coinbase Advanced Trade,
+  //   so there's no product_id to track it with.
+  //
   // Note: ETH/SOL/ADA/ATOM/XTZ show as partly or fully staked in your app.
   // Staked balance won't be in "available_balance" and can't be sold until
   // unstaked, so the bot will simply have nothing to sell for those portions.
