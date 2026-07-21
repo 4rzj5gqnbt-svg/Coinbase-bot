@@ -188,6 +188,19 @@ module.exports = async function handler(req, res) {
             productId: pos.product_id,
             baseSize: pos.base_size,
           });
+
+          if (order.success === false) {
+            await logAndPush({
+              action: "SELL",
+              status: "error",
+              price,
+              regime: pos.last_regime,
+              reasoning,
+              detail: `Order rejected by Coinbase, position left unchanged: ${JSON.stringify(order.error_response || order)}`,
+            });
+            continue; // do NOT update position state — nothing was actually sold
+          }
+
           const proceedsGbp = pos.base_size * price;
 
           await supabase
@@ -209,7 +222,7 @@ module.exports = async function handler(req, res) {
             regime: pos.last_regime,
             amount_gbp: proceedsGbp,
             base_size: pos.base_size,
-            coinbase_order_id: order?.order_id || order?.success_response?.order_id || null,
+            coinbase_order_id: order?.success_response?.order_id || null,
             reasoning,
             detail: JSON.stringify(order),
           });
@@ -304,6 +317,19 @@ module.exports = async function handler(req, res) {
         }
 
         const order = await marketBuy({ productId: pos.product_id, quoteSize: spendGbp });
+
+        if (order.success === false) {
+          await logAndPush({
+            action: "BUY",
+            status: "error",
+            price,
+            regime,
+            reasoning,
+            detail: `Order rejected by Coinbase, no cash was spent: ${JSON.stringify(order.error_response || order)}`,
+          });
+          continue; // do NOT update position state — nothing was actually bought
+        }
+
         const approxBaseSize = spendGbp / price;
 
         await supabase
@@ -326,7 +352,7 @@ module.exports = async function handler(req, res) {
           regime,
           amount_gbp: spendGbp,
           base_size: approxBaseSize,
-          coinbase_order_id: order?.order_id || order?.success_response?.order_id || null,
+          coinbase_order_id: order?.success_response?.order_id || null,
           reasoning,
           detail: JSON.stringify(order),
         });
