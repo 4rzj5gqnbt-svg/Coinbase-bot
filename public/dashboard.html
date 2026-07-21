@@ -142,12 +142,12 @@
       <tr>
         <th>Time</th>
         <th>Coin</th>
-        <th>Action</th>
+        <th>Action (regime)</th>
         <th>Price</th>
-        <th>Peak</th>
-        <th>Amount sold</th>
+        <th>Amount (£)</th>
+        <th>Amount (coin)</th>
         <th>Status</th>
-        <th>Detail</th>
+        <th>Reasoning</th>
       </tr>
     </thead>
     <tbody id="trade-rows">
@@ -212,7 +212,7 @@
 
   async function loadPositions() {
     const { data, error } = await client
-      .from("positions")
+      .from("trading_positions")
       .select("*")
       .order("product_id", { ascending: true });
 
@@ -225,7 +225,7 @@
     }
 
     if (!data || data.length === 0) {
-      container.innerHTML = `<div class="empty">No positions tracked yet — run seed.js</div>`;
+      container.innerHTML = `<div class="empty">No positions tracked yet — run seed_v2.js</div>`;
       return;
     }
 
@@ -233,21 +233,25 @@
       <div class="card">
         <div class="coin">
           ${coinLabel(p.product_id)}
-          <span class="badge ${p.enabled ? 'enabled' : 'disabled'}">
-            ${p.enabled ? 'Tracking' : 'Sold / Off'}
+          <span class="badge ${p.in_position ? 'enabled' : 'disabled'}">
+            ${p.in_position ? 'In a trade' : 'Watching'}
           </span>
         </div>
-        <div class="row"><span>Last check vs check before</span>${fmtChange(p.last_checked_price, p.previous_checked_price)}</div>
-        <div class="row" title="The current price, as of the last check">
+        <div class="row"><span>Regime</span><span>${p.last_regime || '—'}</span></div>
+        <div class="row" title="Current market price for this coin">
           <span>Current price</span><span>${fmtMoney(p.last_checked_price)}</span>
         </div>
-        <div class="row" title="The highest price this coin has reached since tracking began">
-          <span>Highest price reached</span><span>${fmtMoney(p.peak_price)}</span>
+        <div class="row" title="Cash set aside for buying this coin — never mixed with other coins">
+          <span>Cash available to buy</span><span>${fmtMoney(p.cash_gbp)}</span>
         </div>
-        <div class="row" title="The bot will sell if the price drops to this level — 5% below the highest price reached">
-          <span>Sells if price hits</span><span>${fmtMoney(p.peak_price * (1 - p.trailing_stop_pct / 100))}</span>
+        ${p.in_position ? `
+        <div class="row" title="Price when the bot bought in">
+          <span>Bought at</span><span>${fmtMoney(p.entry_price)}</span>
         </div>
-        <div class="row"><span>Drop that triggers a sell</span><span>${p.trailing_stop_pct}%</span></div>
+        <div class="row" title="Highest price since buying (used for momentum trailing stop)">
+          <span>Peak since buying</span><span>${fmtMoney(p.peak_price)}</span>
+        </div>
+        ` : ''}
         <div class="row"><span>Last checked</span><span>${fmtTime(p.last_checked_at)}</span></div>
       </div>
     `).join("");
@@ -255,8 +259,9 @@
 
   async function loadTradeLog() {
     const { data, error } = await client
-      .from("trade_log")
+      .from("trading_log")
       .select("*")
+      .in("action", ["BUY", "SELL"]) // hide the noisy HOLD/SKIP rows from the main view
       .order("created_at", { ascending: false })
       .limit(100);
 
@@ -269,7 +274,7 @@
     }
 
     if (!data || data.length === 0) {
-      tbody.innerHTML = `<tr><td colspan="8" class="empty">No trades yet — nothing has triggered a sell</td></tr>`;
+      tbody.innerHTML = `<tr><td colspan="8" class="empty">No trades yet — nothing has triggered a buy or sell</td></tr>`;
       return;
     }
 
@@ -277,12 +282,12 @@
       <tr>
         <td>${fmtTime(t.created_at)}</td>
         <td>${coinLabel(t.product_id)}</td>
-        <td>${t.action}</td>
+        <td>${t.action} <span style="color:var(--muted);font-size:11px;">(${t.regime || '—'})</span></td>
         <td>${fmtMoney(t.price)}</td>
-        <td>${fmtMoney(t.peak_price)}</td>
-        <td>${t.base_size ?? "—"}</td>
+        <td>${fmtMoney(t.amount_gbp)}</td>
+        <td>${t.base_size ? Number(t.base_size).toFixed(6) : "—"}</td>
         <td class="status-${t.status}">${t.status}</td>
-        <td style="max-width:280px; white-space:normal;">${(t.detail || "").slice(0, 200)}</td>
+        <td style="max-width:320px; white-space:normal;">${(t.reasoning || t.detail || "").slice(0, 240)}</td>
       </tr>
     `).join("");
   }
