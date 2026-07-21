@@ -33,6 +33,7 @@ module.exports = async function handler(req, res) {
           .update({
             peak_price: newPeak,
             last_checked_at: new Date().toISOString(),
+            previous_checked_price: pos.last_checked_price,
             last_checked_price: price,
             updated_at: new Date().toISOString(),
           })

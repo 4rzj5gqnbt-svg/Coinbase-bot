@@ -168,9 +168,35 @@
 
   const client = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
+  const COIN_NAMES = {
+    "BTC-GBP": "Bitcoin",
+    "ETH-GBP": "Ethereum",
+    "SOL-GBP": "Solana",
+    "ADA-GBP": "Cardano",
+    "ATOM-GBP": "Cosmos",
+    "ALGO-GBP": "Algorand",
+    "XTZ-GBP": "Tezos",
+  };
+
+  function coinLabel(productId) {
+    const ticker = productId.split("-")[0];
+    const name = COIN_NAMES[productId] || ticker;
+    return `${name} (${ticker})`;
+  }
+
   function fmtMoney(n) {
     if (n === null || n === undefined) return "—";
     return "£" + Number(n).toLocaleString(undefined, { maximumFractionDigits: 4 });
+  }
+
+  function fmtChange(current, previous) {
+    if (current === null || previous === null || previous === undefined || previous === 0) {
+      return `<span style="color: var(--muted);">—</span>`;
+    }
+    const pct = ((current - previous) / previous) * 100;
+    const color = pct >= 0 ? "var(--green)" : "var(--red)";
+    const sign = pct >= 0 ? "+" : "";
+    return `<span style="color:${color}; font-weight:600;">${sign}${pct.toFixed(2)}%</span>`;
   }
 
   function fmtTime(t) {
@@ -206,15 +232,22 @@
     container.innerHTML = data.map(p => `
       <div class="card">
         <div class="coin">
-          ${p.product_id}
+          ${coinLabel(p.product_id)}
           <span class="badge ${p.enabled ? 'enabled' : 'disabled'}">
             ${p.enabled ? 'Tracking' : 'Sold / Off'}
           </span>
         </div>
-        <div class="row"><span>Peak price</span><span>${fmtMoney(p.peak_price)}</span></div>
-        <div class="row"><span>Last price</span><span>${fmtMoney(p.last_checked_price)}</span></div>
-        <div class="row"><span>Stop level</span><span>${fmtMoney(p.peak_price * (1 - p.trailing_stop_pct / 100))}</span></div>
-        <div class="row"><span>Stop %</span><span>${p.trailing_stop_pct}%</span></div>
+        <div class="row"><span>Last check vs check before</span>${fmtChange(p.last_checked_price, p.previous_checked_price)}</div>
+        <div class="row" title="The current price, as of the last check">
+          <span>Current price</span><span>${fmtMoney(p.last_checked_price)}</span>
+        </div>
+        <div class="row" title="The highest price this coin has reached since tracking began">
+          <span>Highest price reached</span><span>${fmtMoney(p.peak_price)}</span>
+        </div>
+        <div class="row" title="The bot will sell if the price drops to this level — 5% below the highest price reached">
+          <span>Sells if price hits</span><span>${fmtMoney(p.peak_price * (1 - p.trailing_stop_pct / 100))}</span>
+        </div>
+        <div class="row"><span>Drop that triggers a sell</span><span>${p.trailing_stop_pct}%</span></div>
         <div class="row"><span>Last checked</span><span>${fmtTime(p.last_checked_at)}</span></div>
       </div>
     `).join("");
@@ -243,7 +276,7 @@
     tbody.innerHTML = data.map(t => `
       <tr>
         <td>${fmtTime(t.created_at)}</td>
-        <td>${t.product_id}</td>
+        <td>${coinLabel(t.product_id)}</td>
         <td>${t.action}</td>
         <td>${fmtMoney(t.price)}</td>
         <td>${fmtMoney(t.peak_price)}</td>

@@ -8,6 +8,7 @@ create table if not exists positions (
   enabled boolean not null default true,
   last_checked_at timestamptz,
   last_checked_price numeric,
+  previous_checked_price numeric,    -- price from the check before this one, for % change display
   updated_at timestamptz not null default now()
 );
 
@@ -23,3 +24,21 @@ create table if not exists trade_log (
   detail text,
   created_at timestamptz not null default now()
 );
+
+-- Allow the dashboard (using the public anon key) to READ these two tables,
+-- but not insert/update/delete. The bot itself uses the service_role key,
+-- which bypasses RLS entirely, so this doesn't affect the bot's writes.
+alter table positions enable row level security;
+alter table trade_log enable row level security;
+
+create policy "Allow public read on positions"
+  on positions for select
+  using (true);
+
+create policy "Allow public read on trade_log"
+  on trade_log for select
+  using (true);
+
+-- If you already created the `positions` table before this column existed,
+-- run this too (safe to run even if the column already exists):
+alter table positions add column if not exists previous_checked_price numeric;
