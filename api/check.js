@@ -1,4 +1,4 @@
-const { getSpotPrice, listAccounts, marketSell, marketBuy, getCandles } = require("../lib/coinbase");
+const { getSpotPrice, listAccounts, marketSell, marketBuy, getCandles, getBaseIncrement, roundToIncrement } = require("../lib/coinbase");
 const { getSupabase } = require("../lib/supabase");
 const {
   sma,
@@ -259,6 +259,23 @@ module.exports = async function handler(req, res) {
           } else {
             sellBaseSize = pos.base_size;
             sellType = "full (stop-loss, no gain to skim)";
+          }
+
+          // Coinbase rejects orders with more decimal places than the coin
+          // allows (e.g. ADA might only allow whole numbers) — round down
+          // to a valid amount before submitting.
+          const baseIncrement = await getBaseIncrement(pos.product_id);
+          sellBaseSize = roundToIncrement(sellBaseSize, baseIncrement);
+
+          if (sellBaseSize <= 0) {
+            await logAndPush({
+              action: "SELL",
+              status: "skipped",
+              price,
+              regime: pos.last_regime,
+              reasoning: `${reasoning} [profit portion rounds to 0 at this coin's minimum order precision — nothing to sell yet]`,
+            });
+            continue;
           }
 
           const order = await marketSell({
