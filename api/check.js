@@ -18,6 +18,18 @@ const MOMENTUM_TRAILING_STOP_PCT = 0.025; // 2.5%
 const MEAN_REVERSION_TAKE_PROFIT_PCT = 0.04; // midpoint of 3-5%
 const MEAN_REVERSION_STOP_LOSS_PCT = 0.025; // 2-3% band, using 2.5%
 
+// Entry-condition thresholds — loosened from the original spec so the bot
+// finds more (lower-conviction) trades instead of sitting idle for long
+// stretches. Loosening these means more trades and more fee drag, and each
+// individual trade is less "confirmed" than the original stricter version.
+const MOMENTUM_ATR_MULTIPLE = 0.6; // was 1.2
+const MOMENTUM_VOLUME_MULTIPLE = 1.2; // was 1.5
+const MOMENTUM_RESISTANCE_PROXIMITY = 0.995; // was: must fully break above (1.0)
+const MEAN_REVERSION_ATR_MULTIPLE = 0.8; // was 1.5
+const MEAN_REVERSION_RSI_OVERSOLD = 40; // was 30
+const MEAN_REVERSION_VOLUME_MULTIPLE = 1.2; // was 1.5
+const MEAN_REVERSION_SUPPORT_PROXIMITY = 1.02; // was 1.01
+
 module.exports = async function handler(req, res) {
   const auth = req.headers["authorization"];
   if (auth !== `Bearer ${process.env.CRON_SECRET}`) {
@@ -293,24 +305,24 @@ module.exports = async function handler(req, res) {
 
         if (regime === "MOMENTUM") {
           const priceMove = price - prevCandle.close;
-          const brokeResistance = resistance !== null && price > resistance;
-          const volumeSpike = avgVol !== null && currentVolume >= 1.5 * avgVol;
-          const bigEnoughMove = atr1h !== null && priceMove >= 1.2 * atr1h;
-          diagnostics = `move=${priceMove.toFixed(4)} (need>=${(1.2 * atr1h).toFixed(4)}: ${bigEnoughMove}), volume=${currentVolume.toFixed(2)} (need>=${(1.5 * avgVol).toFixed(2)}: ${volumeSpike}), price=${price} vs resistance=${resistance?.toFixed(4)} (need broken: ${brokeResistance})`;
+          const brokeResistance = resistance !== null && price > resistance * MOMENTUM_RESISTANCE_PROXIMITY;
+          const volumeSpike = avgVol !== null && currentVolume >= MOMENTUM_VOLUME_MULTIPLE * avgVol;
+          const bigEnoughMove = atr1h !== null && priceMove >= MOMENTUM_ATR_MULTIPLE * atr1h;
+          diagnostics = `move=${priceMove.toFixed(4)} (need>=${(MOMENTUM_ATR_MULTIPLE * atr1h).toFixed(4)}: ${bigEnoughMove}), volume=${currentVolume.toFixed(2)} (need>=${(MOMENTUM_VOLUME_MULTIPLE * avgVol).toFixed(2)}: ${volumeSpike}), price=${price} vs resistance*${MOMENTUM_RESISTANCE_PROXIMITY}=${(resistance * MOMENTUM_RESISTANCE_PROXIMITY).toFixed(4)} (${brokeResistance})`;
           if (bigEnoughMove && volumeSpike && brokeResistance) {
             shouldBuy = true;
-            reasoning = `Momentum breakout: +${priceMove.toFixed(4)} move (>=1.2x ATR ${atr1h.toFixed(4)}), volume ${currentVolume.toFixed(2)} >= 1.5x avg ${avgVol.toFixed(2)}, broke resistance ${resistance.toFixed(4)}.`;
+            reasoning = `Momentum breakout (loosened thresholds): +${priceMove.toFixed(4)} move (>=${MOMENTUM_ATR_MULTIPLE}x ATR ${atr1h.toFixed(4)}), volume ${currentVolume.toFixed(2)} >= ${MOMENTUM_VOLUME_MULTIPLE}x avg ${avgVol.toFixed(2)}, near/above resistance ${resistance.toFixed(4)}.`;
           }
         } else {
           const priceDrop = prevCandle.close - price;
-          const nearSupport = support !== null && price <= support * 1.01;
-          const volumeSpike = avgVol !== null && currentVolume >= 1.5 * avgVol;
-          const bigEnoughDrop = atr1h !== null && priceDrop >= 1.5 * atr1h;
-          const oversold = rsi14 !== null && rsi14 <= 30;
-          diagnostics = `drop=${priceDrop.toFixed(4)} (need>=${(1.5 * atr1h).toFixed(4)}: ${bigEnoughDrop}), RSI=${rsi14?.toFixed(1)} (need<=30: ${oversold}), volume=${currentVolume.toFixed(2)} (need>=${(1.5 * avgVol).toFixed(2)}: ${volumeSpike}), price=${price} vs support=${support?.toFixed(4)} (need near: ${nearSupport})`;
+          const nearSupport = support !== null && price <= support * MEAN_REVERSION_SUPPORT_PROXIMITY;
+          const volumeSpike = avgVol !== null && currentVolume >= MEAN_REVERSION_VOLUME_MULTIPLE * avgVol;
+          const bigEnoughDrop = atr1h !== null && priceDrop >= MEAN_REVERSION_ATR_MULTIPLE * atr1h;
+          const oversold = rsi14 !== null && rsi14 <= MEAN_REVERSION_RSI_OVERSOLD;
+          diagnostics = `drop=${priceDrop.toFixed(4)} (need>=${(MEAN_REVERSION_ATR_MULTIPLE * atr1h).toFixed(4)}: ${bigEnoughDrop}), RSI=${rsi14?.toFixed(1)} (need<=${MEAN_REVERSION_RSI_OVERSOLD}: ${oversold}), volume=${currentVolume.toFixed(2)} (need>=${(MEAN_REVERSION_VOLUME_MULTIPLE * avgVol).toFixed(2)}: ${volumeSpike}), price=${price} vs support*${MEAN_REVERSION_SUPPORT_PROXIMITY}=${(support * MEAN_REVERSION_SUPPORT_PROXIMITY).toFixed(4)} (${nearSupport})`;
           if (bigEnoughDrop && oversold && volumeSpike && nearSupport) {
             shouldBuy = true;
-            reasoning = `Mean-reversion dip: -${priceDrop.toFixed(4)} drop (>=1.5x ATR ${atr1h.toFixed(4)}), RSI ${rsi14.toFixed(1)} <= 30, volume spike, near support ${support.toFixed(4)}.`;
+            reasoning = `Mean-reversion dip (loosened thresholds): -${priceDrop.toFixed(4)} drop (>=${MEAN_REVERSION_ATR_MULTIPLE}x ATR ${atr1h.toFixed(4)}), RSI ${rsi14.toFixed(1)} <= ${MEAN_REVERSION_RSI_OVERSOLD}, volume spike, near support ${support.toFixed(4)}.`;
           }
         }
 
