@@ -46,6 +46,7 @@ module.exports = async function handler(req, res) {
       .eq("enabled", true);
     if (error) throw error;
 
+    const accounts = await listAccounts();
     const pricesNow = {};
     for (const pos of positions) {
       pricesNow[pos.product_id] = await getSpotPrice(pos.product_id);
@@ -89,6 +90,52 @@ module.exports = async function handler(req, res) {
 
       try {
         const price = pricesNow[pos.product_id];
+
+        // Reconcile with your ACTUAL Coinbase balance. If you manually
+        // bought/sold this coin outside the bot (e.g. via the Coinbase
+        // app), the bot's own ledger (base_size) would otherwise be stale
+        // and it would keep thinking it holds nothing when you really do
+        // (or vice versa). We correct base_size to match reality here,
+        // every check, before making any buy/sell decision.
+        const account = accounts.find((a) => a.currency === pos.base_currency);
+        const actualBalance = account ? parseFloat(account.available_balance.value) : 0;
+        const trackedBalance = pos.base_size || 0;
+        const balanceDiff = Math.abs(actualBalance - trackedBalance);
+        const balanceMismatch = balanceDiff > trackedBalance * 0.01 + 0.00000001; // >1% relative, plus a tiny absolute floor for dust/rounding
+
+        if (balanceMismatch) {
+          const wasInPosition = pos.in_position;
+          pos.base_size = actualBalance;
+          pos.in_position = actualBalance > 0;
+          if (actualBalance > 0 && !wasInPosition) {
+            // We now hold this coin but the bot didn't know — likely a
+            // manual buy. We don't know your real purchase price, so use
+            // the current price as a starting reference point.
+            pos.entry_price = price;
+            pos.peak_price = price;
+          } else if (actualBalance <= 0) {
+            pos.entry_price = null;
+            pos.peak_price = null;
+          }
+
+          await supabase
+            .from("trading_positions")
+            .update({
+              base_size: pos.base_size,
+              in_position: pos.in_position,
+              entry_price: pos.entry_price,
+              peak_price: pos.peak_price,
+            })
+            .eq("product_id", pos.product_id);
+
+          await logAndPush({
+            action: "RECONCILE",
+            status: "success",
+            price,
+            reasoning: `Bot's tracked balance (${trackedBalance}) didn't match your actual Coinbase balance (${actualBalance}) — corrected. This usually means a manual buy/sell happened outside the bot.`,
+          });
+        }
+
 
         const inCooldown =
           pos.last_trade_at &&
