@@ -184,9 +184,27 @@ module.exports = async function handler(req, res) {
             continue;
           }
 
+          // Decide how much to sell. Default is to skim only the PROFIT
+          // portion — the coin-equivalent of the gain since entry — so the
+          // original principal stays invested and keeps riding the coin.
+          // Exception: if price is at or below entry (a stop-loss firing,
+          // not a gain), there's no profit to skim, so the full remaining
+          // position is sold to protect capital instead.
+          const hasGain = price > pos.entry_price;
+          let sellBaseSize;
+          let sellType;
+          if (hasGain) {
+            const profitGbp = pos.base_size * (price - pos.entry_price);
+            sellBaseSize = profitGbp / price;
+            sellType = "partial (profit only)";
+          } else {
+            sellBaseSize = pos.base_size;
+            sellType = "full (stop-loss, no gain to skim)";
+          }
+
           const order = await marketSell({
             productId: pos.product_id,
-            baseSize: pos.base_size,
+            baseSize: sellBaseSize,
           });
 
           if (order.success === false) {
@@ -195,22 +213,27 @@ module.exports = async function handler(req, res) {
               status: "error",
               price,
               regime: pos.last_regime,
-              reasoning,
+              reasoning: `${reasoning} [${sellType}]`,
               detail: `Order rejected by Coinbase, position left unchanged: ${JSON.stringify(order.error_response || order)}`,
             });
             continue; // do NOT update position state — nothing was actually sold
           }
 
-          const proceedsGbp = pos.base_size * price;
+          const proceedsGbp = sellBaseSize * price;
+          const remainingBaseSize = pos.base_size - sellBaseSize;
+          const stillHolding = remainingBaseSize > 0;
 
           await supabase
             .from("trading_positions")
             .update({
               cash_gbp: pos.cash_gbp + proceedsGbp,
-              base_size: 0,
-              in_position: false,
-              entry_price: null,
-              peak_price: null,
+              base_size: stillHolding ? remainingBaseSize : 0,
+              // If we skimmed profit and kept principal, we're still "in a
+              // position" — reset entry/peak to now so the next climb is
+              // measured fresh from here.
+              in_position: stillHolding,
+              entry_price: stillHolding ? price : null,
+              peak_price: stillHolding ? price : null,
               last_trade_at: new Date().toISOString(),
             })
             .eq("product_id", pos.product_id);
@@ -221,9 +244,9 @@ module.exports = async function handler(req, res) {
             price,
             regime: pos.last_regime,
             amount_gbp: proceedsGbp,
-            base_size: pos.base_size,
+            base_size: sellBaseSize,
             coinbase_order_id: order?.success_response?.order_id || null,
-            reasoning,
+            reasoning: `${reasoning} [${sellType} — sold ${sellBaseSize.toFixed(8)} of ${pos.base_size}, kept ${remainingBaseSize.toFixed(8)} invested]`,
             detail: JSON.stringify(order),
           });
           continue;
@@ -266,12 +289,14 @@ module.exports = async function handler(req, res) {
 
         let shouldBuy = false;
         let reasoning = "";
+        let diagnostics = "";
 
         if (regime === "MOMENTUM") {
           const priceMove = price - prevCandle.close;
           const brokeResistance = resistance !== null && price > resistance;
           const volumeSpike = avgVol !== null && currentVolume >= 1.5 * avgVol;
           const bigEnoughMove = atr1h !== null && priceMove >= 1.2 * atr1h;
+          diagnostics = `move=${priceMove.toFixed(4)} (need>=${(1.2 * atr1h).toFixed(4)}: ${bigEnoughMove}), volume=${currentVolume.toFixed(2)} (need>=${(1.5 * avgVol).toFixed(2)}: ${volumeSpike}), price=${price} vs resistance=${resistance?.toFixed(4)} (need broken: ${brokeResistance})`;
           if (bigEnoughMove && volumeSpike && brokeResistance) {
             shouldBuy = true;
             reasoning = `Momentum breakout: +${priceMove.toFixed(4)} move (>=1.2x ATR ${atr1h.toFixed(4)}), volume ${currentVolume.toFixed(2)} >= 1.5x avg ${avgVol.toFixed(2)}, broke resistance ${resistance.toFixed(4)}.`;
@@ -282,6 +307,7 @@ module.exports = async function handler(req, res) {
           const volumeSpike = avgVol !== null && currentVolume >= 1.5 * avgVol;
           const bigEnoughDrop = atr1h !== null && priceDrop >= 1.5 * atr1h;
           const oversold = rsi14 !== null && rsi14 <= 30;
+          diagnostics = `drop=${priceDrop.toFixed(4)} (need>=${(1.5 * atr1h).toFixed(4)}: ${bigEnoughDrop}), RSI=${rsi14?.toFixed(1)} (need<=30: ${oversold}), volume=${currentVolume.toFixed(2)} (need>=${(1.5 * avgVol).toFixed(2)}: ${volumeSpike}), price=${price} vs support=${support?.toFixed(4)} (need near: ${nearSupport})`;
           if (bigEnoughDrop && oversold && volumeSpike && nearSupport) {
             shouldBuy = true;
             reasoning = `Mean-reversion dip: -${priceDrop.toFixed(4)} drop (>=1.5x ATR ${atr1h.toFixed(4)}), RSI ${rsi14.toFixed(1)} <= 30, volume spike, near support ${support.toFixed(4)}.`;
@@ -294,7 +320,7 @@ module.exports = async function handler(req, res) {
             status: "skipped",
             price,
             regime,
-            reasoning: "No entry condition met.",
+            reasoning: `No entry condition met. ${diagnostics}`,
           });
           continue;
         }
