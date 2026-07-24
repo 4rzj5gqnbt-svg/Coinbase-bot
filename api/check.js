@@ -31,6 +31,7 @@ const MEAN_REVERSION_VOLUME_MULTIPLE = 1.2; // was 1.5
 const MEAN_REVERSION_SUPPORT_PROXIMITY = 1.02; // was 1.01
 
 module.exports = async function handler(req, res) {
+  console.log("VERSION CHECK: buy-fix-deployed-v2");
   const auth = req.headers["authorization"];
   if (auth !== `Bearer ${process.env.CRON_SECRET}`) {
     return res.status(401).json({ error: "unauthorized" });
@@ -194,9 +195,32 @@ module.exports = async function handler(req, res) {
           continue;
         }
 
-        // ============= ALREADY IN A POSITION: CHECK SELL CONDITIONS =============
-        if (pos.in_position) {
-          const newPeak = Math.max(pos.peak_price || pos.entry_price, price);
+        // A coin is only treated as "meaningfully held" if it's worth more
+        // than a few pence — otherwise leftover dust (e.g. 0.0000000067 ETH
+        // from a previous profit-skim) would permanently block the bot from
+        // ever checking buy conditions again, leaving cash stuck idle
+        // forever. This was a real bug: coins never returned to a
+        // buyable/"watching" state once any tiny fraction remained.
+        const DUST_THRESHOLD_GBP = 0.05;
+        const holdingValueGbp = pos.base_size * price;
+        const hasMeaningfulHolding = holdingValueGbp > DUST_THRESHOLD_GBP;
+
+        // Self-correct stale state: if the DB still says "in position" but
+        // what's left is just unsellable dust, fix that now so this coin
+        // isn't stuck permanently counted as an open trade.
+        if (!hasMeaningfulHolding && pos.in_position) {
+          await supabase
+            .from("trading_positions")
+            .update({ in_position: false })
+            .eq("product_id", pos.product_id);
+          pos.in_position = false;
+        }
+
+        let sellExecutedThisCycle = false;
+
+        // ============= CHECK SELL CONDITIONS (if meaningfully holding) =============
+        if (hasMeaningfulHolding) {
+          const newPeak = Math.max(pos.peak_price || pos.entry_price || price, price);
           let shouldSell = false;
           let reasoning = "";
 
@@ -230,6 +254,7 @@ module.exports = async function handler(req, res) {
               .from("trading_positions")
               .update({ peak_price: newPeak })
               .eq("product_id", pos.product_id);
+            pos.peak_price = newPeak;
           }
 
           if (!shouldSell) {
@@ -240,96 +265,92 @@ module.exports = async function handler(req, res) {
               regime: pos.last_regime,
               reasoning: "No exit condition met.",
             });
-            continue;
-          }
-
-          // Decide how much to sell. Default is to skim only the PROFIT
-          // portion — the coin-equivalent of the gain since entry — so the
-          // original principal stays invested and keeps riding the coin.
-          // Exception: if price is at or below entry (a stop-loss firing,
-          // not a gain), there's no profit to skim, so the full remaining
-          // position is sold to protect capital instead.
-          const hasGain = price > pos.entry_price;
-          let sellBaseSize;
-          let sellType;
-          if (hasGain) {
-            const profitGbp = pos.base_size * (price - pos.entry_price);
-            sellBaseSize = profitGbp / price;
-            sellType = "partial (profit only)";
           } else {
-            sellBaseSize = pos.base_size;
-            sellType = "full (stop-loss, no gain to skim)";
+            const hasGain = price > pos.entry_price;
+            let sellBaseSize;
+            let sellType;
+            if (hasGain) {
+              const profitGbp = pos.base_size * (price - pos.entry_price);
+              sellBaseSize = profitGbp / price;
+              sellType = "partial (profit only)";
+            } else {
+              sellBaseSize = pos.base_size;
+              sellType = "full (stop-loss, no gain to skim)";
+            }
+
+            const baseIncrement = await getBaseIncrement(pos.product_id);
+            sellBaseSize = roundToIncrement(sellBaseSize, baseIncrement);
+
+            if (sellBaseSize <= 0) {
+              await logAndPush({
+                action: "SELL",
+                status: "skipped",
+                price,
+                regime: pos.last_regime,
+                reasoning: `${reasoning} [profit portion rounds to 0 at this coin's minimum order precision — nothing to sell yet]`,
+              });
+            } else {
+              const order = await marketSell({
+                productId: pos.product_id,
+                baseSize: sellBaseSize,
+              });
+
+              if (order.success === false) {
+                await logAndPush({
+                  action: "SELL",
+                  status: "error",
+                  price,
+                  regime: pos.last_regime,
+                  reasoning: `${reasoning} [${sellType}]`,
+                  detail: `Order rejected by Coinbase, position left unchanged: ${JSON.stringify(order.error_response || order)}`,
+                });
+              } else {
+                const proceedsGbp = sellBaseSize * price;
+                const remainingBaseSize = pos.base_size - sellBaseSize;
+                const stillHolding = remainingBaseSize * price > DUST_THRESHOLD_GBP;
+
+                await supabase
+                  .from("trading_positions")
+                  .update({
+                    cash_gbp: pos.cash_gbp + proceedsGbp,
+                    base_size: stillHolding ? remainingBaseSize : 0,
+                    in_position: stillHolding,
+                    entry_price: stillHolding ? price : null,
+                    peak_price: stillHolding ? price : null,
+                    last_trade_at: new Date().toISOString(),
+                  })
+                  .eq("product_id", pos.product_id);
+
+                // Keep our in-memory copy in sync for the buy-check below.
+                pos.cash_gbp = pos.cash_gbp + proceedsGbp;
+                pos.base_size = stillHolding ? remainingBaseSize : 0;
+                pos.in_position = stillHolding;
+
+                await logAndPush({
+                  action: "SELL",
+                  status: "success",
+                  price,
+                  regime: pos.last_regime,
+                  amount_gbp: proceedsGbp,
+                  base_size: sellBaseSize,
+                  coinbase_order_id: order?.success_response?.order_id || null,
+                  reasoning: `${reasoning} [${sellType} — sold ${sellBaseSize.toFixed(8)} of ${(remainingBaseSize + sellBaseSize).toFixed(8)}, kept ${remainingBaseSize.toFixed(8)} invested]`,
+                  detail: JSON.stringify(order),
+                });
+                sellExecutedThisCycle = true;
+              }
+            }
           }
-
-          // Coinbase rejects orders with more decimal places than the coin
-          // allows (e.g. ADA might only allow whole numbers) — round down
-          // to a valid amount before submitting.
-          const baseIncrement = await getBaseIncrement(pos.product_id);
-          sellBaseSize = roundToIncrement(sellBaseSize, baseIncrement);
-
-          if (sellBaseSize <= 0) {
-            await logAndPush({
-              action: "SELL",
-              status: "skipped",
-              price,
-              regime: pos.last_regime,
-              reasoning: `${reasoning} [profit portion rounds to 0 at this coin's minimum order precision — nothing to sell yet]`,
-            });
-            continue;
-          }
-
-          const order = await marketSell({
-            productId: pos.product_id,
-            baseSize: sellBaseSize,
-          });
-
-          if (order.success === false) {
-            await logAndPush({
-              action: "SELL",
-              status: "error",
-              price,
-              regime: pos.last_regime,
-              reasoning: `${reasoning} [${sellType}]`,
-              detail: `Order rejected by Coinbase, position left unchanged: ${JSON.stringify(order.error_response || order)}`,
-            });
-            continue; // do NOT update position state — nothing was actually sold
-          }
-
-          const proceedsGbp = sellBaseSize * price;
-          const remainingBaseSize = pos.base_size - sellBaseSize;
-          const stillHolding = remainingBaseSize > 0;
-
-          await supabase
-            .from("trading_positions")
-            .update({
-              cash_gbp: pos.cash_gbp + proceedsGbp,
-              base_size: stillHolding ? remainingBaseSize : 0,
-              // If we skimmed profit and kept principal, we're still "in a
-              // position" — reset entry/peak to now so the next climb is
-              // measured fresh from here.
-              in_position: stillHolding,
-              entry_price: stillHolding ? price : null,
-              peak_price: stillHolding ? price : null,
-              last_trade_at: new Date().toISOString(),
-            })
-            .eq("product_id", pos.product_id);
-
-          await logAndPush({
-            action: "SELL",
-            status: "success",
-            price,
-            regime: pos.last_regime,
-            amount_gbp: proceedsGbp,
-            base_size: sellBaseSize,
-            coinbase_order_id: order?.success_response?.order_id || null,
-            reasoning: `${reasoning} [${sellType} — sold ${sellBaseSize.toFixed(8)} of ${pos.base_size}, kept ${remainingBaseSize.toFixed(8)} invested]`,
-            detail: JSON.stringify(order),
-          });
-          continue;
         }
 
-        // ============= NOT IN A POSITION: CHECK BUY CONDITIONS =============
-
+        // ============= CHECK BUY CONDITIONS =============
+        // Runs regardless of whether we already hold some of this coin —
+        // averaging into an existing holding on a dip is fine. Skipped only
+        // if we just sold this same coin this cycle (avoid buying straight
+        // back into what we just sold in the same run).
+        if (sellExecutedThisCycle) {
+          continue;
+        }
         if (haltedToday) {
           await logAndPush({
             action: "SKIP",
@@ -433,15 +454,23 @@ module.exports = async function handler(req, res) {
         }
 
         const approxBaseSize = spendGbp / price;
+        const newBaseSize = pos.base_size + approxBaseSize;
+        // If already holding some, blend entry price (weighted average);
+        // otherwise this is a fresh entry.
+        const newEntryPrice =
+          pos.base_size > 0 && pos.entry_price
+            ? (pos.entry_price * pos.base_size + price * approxBaseSize) / newBaseSize
+            : price;
+        const newPeak = Math.max(pos.peak_price || price, price);
 
         await supabase
           .from("trading_positions")
           .update({
             cash_gbp: pos.cash_gbp - spendGbp,
-            base_size: approxBaseSize,
+            base_size: newBaseSize,
             in_position: true,
-            entry_price: price,
-            peak_price: price,
+            entry_price: newEntryPrice,
+            peak_price: newPeak,
             last_regime: regime,
             last_trade_at: new Date().toISOString(),
           })
