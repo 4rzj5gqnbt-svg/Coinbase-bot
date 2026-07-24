@@ -31,7 +31,6 @@ const MEAN_REVERSION_VOLUME_MULTIPLE = 1.2; // was 1.5
 const MEAN_REVERSION_SUPPORT_PROXIMITY = 1.02; // was 1.01
 
 module.exports = async function handler(req, res) {
-  console.log("VERSION CHECK: buy-fix-deployed-v2");
   const auth = req.headers["authorization"];
   if (auth !== `Bearer ${process.env.CRON_SECRET}`) {
     return res.status(401).json({ error: "unauthorized" });
@@ -224,28 +223,40 @@ module.exports = async function handler(req, res) {
           let shouldSell = false;
           let reasoning = "";
 
+          // isProtectiveExit distinguishes a genuine capital-protection exit
+          // (price fell below your original cost basis) from a routine
+          // profit-taking signal. Only the former should ever close the
+          // whole position — profit-taking signals just skim the gain.
+          let isProtectiveExit = false;
+
           if (pos.last_regime === "MOMENTUM") {
             const stopPrice = newPeak * (1 - MOMENTUM_TRAILING_STOP_PCT);
             const momentumWeakening = rsi14 >= 75 && price < prevCandle.close;
-            if (price <= stopPrice) {
+            const hardStopPrice = pos.entry_price * (1 - MOMENTUM_TRAILING_STOP_PCT);
+            if (price <= hardStopPrice) {
               shouldSell = true;
-              reasoning = `Momentum trailing stop: price ${price} <= ${stopPrice.toFixed(4)} (2.5% below peak ${newPeak}).`;
+              isProtectiveExit = true;
+              reasoning = `Stop-loss: price ${price} fell ${(MOMENTUM_TRAILING_STOP_PCT * 100).toFixed(1)}% below original entry ${pos.entry_price} — closing to protect capital.`;
+            } else if (price <= stopPrice) {
+              shouldSell = true;
+              reasoning = `Momentum trailing stop: price ${price} <= ${stopPrice.toFixed(4)} (2.5% below peak ${newPeak}) — taking profit, keeping principal.`;
             } else if (momentumWeakening) {
               shouldSell = true;
-              reasoning = `RSI overbought (${rsi14.toFixed(1)}) and price weakening.`;
+              reasoning = `RSI overbought (${rsi14.toFixed(1)}) and price weakening — taking profit, keeping principal.`;
             }
           } else {
             const takeProfitPrice = pos.entry_price * (1 + MEAN_REVERSION_TAKE_PROFIT_PCT);
             const stopLossPrice = pos.entry_price * (1 - MEAN_REVERSION_STOP_LOSS_PCT);
-            if (price >= takeProfitPrice) {
+            if (price <= stopLossPrice) {
               shouldSell = true;
-              reasoning = `Take-profit hit: price ${price} >= ${takeProfitPrice.toFixed(4)} (+${(MEAN_REVERSION_TAKE_PROFIT_PCT * 100).toFixed(1)}% from entry).`;
+              isProtectiveExit = true;
+              reasoning = `Stop-loss hit: price ${price} <= ${stopLossPrice.toFixed(4)} — closing to protect capital.`;
+            } else if (price >= takeProfitPrice) {
+              shouldSell = true;
+              reasoning = `Take-profit hit: price ${price} >= ${takeProfitPrice.toFixed(4)} (+${(MEAN_REVERSION_TAKE_PROFIT_PCT * 100).toFixed(1)}% from entry) — taking profit, keeping principal.`;
             } else if (rsi14 >= 60) {
               shouldSell = true;
-              reasoning = `RSI back to neutral/overbought (${rsi14.toFixed(1)}) — exiting mean-reversion trade.`;
-            } else if (price <= stopLossPrice) {
-              shouldSell = true;
-              reasoning = `Stop-loss hit: price ${price} <= ${stopLossPrice.toFixed(4)}.`;
+              reasoning = `RSI back to neutral/overbought (${rsi14.toFixed(1)}) — taking profit, keeping principal.`;
             }
           }
 
@@ -266,16 +277,18 @@ module.exports = async function handler(req, res) {
               reasoning: "No exit condition met.",
             });
           } else {
-            const hasGain = price > pos.entry_price;
+            // Full exit ONLY on a genuine protective stop-loss. Every other
+            // trigger is profit-taking: skim the gain, keep the principal
+            // invested so it keeps riding the coin.
             let sellBaseSize;
             let sellType;
-            if (hasGain) {
-              const profitGbp = pos.base_size * (price - pos.entry_price);
-              sellBaseSize = profitGbp / price;
-              sellType = "partial (profit only)";
-            } else {
+            if (isProtectiveExit) {
               sellBaseSize = pos.base_size;
-              sellType = "full (stop-loss, no gain to skim)";
+              sellType = "full exit (stop-loss — protecting capital)";
+            } else {
+              const profitGbp = pos.base_size * Math.max(0, price - pos.entry_price);
+              sellBaseSize = profitGbp / price;
+              sellType = "partial (profit only, principal kept invested)";
             }
 
             const baseIncrement = await getBaseIncrement(pos.product_id);
@@ -315,7 +328,13 @@ module.exports = async function handler(req, res) {
                     cash_gbp: pos.cash_gbp + proceedsGbp,
                     base_size: stillHolding ? remainingBaseSize : 0,
                     in_position: stillHolding,
-                    entry_price: stillHolding ? price : null,
+                    // Keep the ORIGINAL entry price when we've only skimmed
+                    // profit — it's still the true cost basis for what's
+                    // left. Only clear it when the position is fully closed.
+                    entry_price: stillHolding ? pos.entry_price : null,
+                    // Reset the peak so the trailing stop measures the next
+                    // climb from here rather than from an old high we've
+                    // already taken profit on.
                     peak_price: stillHolding ? price : null,
                     last_trade_at: new Date().toISOString(),
                   })
