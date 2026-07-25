@@ -13,6 +13,13 @@ const {
 const COOLDOWN_MS = 30 * 60 * 1000; // 30 minutes
 const MAX_SIMULTANEOUS_TRADES = 5;
 const RISK_PER_TRADE_PCT = 0.02; // 2% of total capital
+
+// Shared cash pool model: one pot of GBP (stored in risk_state.shared_cash_gbp)
+// funds buys of ANY coin, and profit-skims flow back into it. To avoid the
+// pool being drained into a single coin, each buy is capped to a fraction of
+// the *current* pool: 30% for the main coins, 10% for everything else.
+const POOL_CAP_PCT = { "BTC-GBP": 0.30, "ETH-GBP": 0.30, "ADA-GBP": 0.30 };
+const POOL_CAP_PCT_DEFAULT = 0.10;
 const DAILY_LOSS_LIMIT_PCT = 0.05; // 5%
 const MOMENTUM_TRAILING_STOP_PCT = 0.025; // 2.5%
 const MEAN_REVERSION_TAKE_PROFIT_PCT = 0.04; // midpoint of 3-5%
@@ -51,10 +58,12 @@ module.exports = async function handler(req, res) {
     for (const pos of positions) {
       pricesNow[pos.product_id] = await getSpotPrice(pos.product_id);
     }
-    const totalCapitalNow = positions.reduce(
-      (sum, p) => sum + p.cash_gbp + p.base_size * (pricesNow[p.product_id] || 0),
+    const positionsValue = positions.reduce(
+      (sum, p) => sum + p.base_size * (pricesNow[p.product_id] || 0),
       0
     );
+    // Shared pool is added below once it's loaded from risk_state.
+    let totalCapitalNow = positionsValue;
 
     let { data: riskRows } = await supabase.from("risk_state").select("*").eq("id", 1);
     let risk = riskRows && riskRows[0];
@@ -65,9 +74,15 @@ module.exports = async function handler(req, res) {
         day: today,
         day_start_capital_gbp: totalCapitalNow,
         trading_halted_today: false,
+        // Carry the shared cash pool across the daily reset — it's real
+        // money, not a per-day counter, so it must never be wiped.
+        shared_cash_gbp: risk ? risk.shared_cash_gbp || 0 : 0,
       };
       await supabase.from("risk_state").upsert(risk);
     }
+    // Live handle on the shared pool for this run.
+    let sharedCash = parseFloat(risk.shared_cash_gbp || 0);
+    totalCapitalNow += sharedCash;
     const drawdownPct =
       risk.day_start_capital_gbp > 0
         ? (risk.day_start_capital_gbp - totalCapitalNow) / risk.day_start_capital_gbp
@@ -322,10 +337,14 @@ module.exports = async function handler(req, res) {
                 const remainingBaseSize = pos.base_size - sellBaseSize;
                 const stillHolding = remainingBaseSize * price > DUST_THRESHOLD_GBP;
 
+                // Proceeds flow into the SHARED pool, not a per-coin pot —
+                // so profit skimmed from one coin's climb can fund a buy of
+                // any coin next time a signal fires.
+                sharedCash += proceedsGbp;
+
                 await supabase
                   .from("trading_positions")
                   .update({
-                    cash_gbp: pos.cash_gbp + proceedsGbp,
                     base_size: stillHolding ? remainingBaseSize : 0,
                     in_position: stillHolding,
                     // Keep the ORIGINAL entry price when we've only skimmed
@@ -340,8 +359,12 @@ module.exports = async function handler(req, res) {
                   })
                   .eq("product_id", pos.product_id);
 
+                await supabase
+                  .from("risk_state")
+                  .update({ shared_cash_gbp: sharedCash })
+                  .eq("id", 1);
+
                 // Keep our in-memory copy in sync for the buy-check below.
-                pos.cash_gbp = pos.cash_gbp + proceedsGbp;
                 pos.base_size = stillHolding ? remainingBaseSize : 0;
                 pos.in_position = stillHolding;
 
@@ -392,13 +415,13 @@ module.exports = async function handler(req, res) {
           continue;
         }
 
-        if (pos.cash_gbp < 1) {
+        if (sharedCash < 1) {
           await logAndPush({
             action: "SKIP",
             status: "skipped",
             price,
             regime,
-            reasoning: "No cash allocated to this coin (or balance too small to trade).",
+            reasoning: `Shared cash pool too low to trade (£${sharedCash.toFixed(2)}).`,
           });
           continue;
         }
@@ -444,8 +467,11 @@ module.exports = async function handler(req, res) {
         const stopDistancePct =
           regime === "MOMENTUM" ? MOMENTUM_TRAILING_STOP_PCT : MEAN_REVERSION_STOP_LOSS_PCT;
         const maxRiskGbp = RISK_PER_TRADE_PCT * totalCapitalNow;
-        const riskBasedSizeGbp = stopDistancePct > 0 ? maxRiskGbp / stopDistancePct : pos.cash_gbp;
-        const spendGbp = Math.min(pos.cash_gbp, riskBasedSizeGbp);
+        const riskBasedSizeGbp = stopDistancePct > 0 ? maxRiskGbp / stopDistancePct : sharedCash;
+        // Per-coin cap on the shared pool: 30% for main coins, 10% otherwise.
+        const capPct = POOL_CAP_PCT[pos.product_id] || POOL_CAP_PCT_DEFAULT;
+        const capGbp = sharedCash * capPct;
+        const spendGbp = Math.min(sharedCash, riskBasedSizeGbp, capGbp);
 
         if (spendGbp < 1) {
           await logAndPush({
@@ -453,7 +479,7 @@ module.exports = async function handler(req, res) {
             status: "skipped",
             price,
             regime,
-            reasoning: "Risk-adjusted position size rounds to under £1 — skipping.",
+            reasoning: `Position size after ${(capPct * 100).toFixed(0)}% pool cap and risk sizing rounds to under £1 (pool £${sharedCash.toFixed(2)}) — skipping.`,
           });
           continue;
         }
@@ -482,10 +508,16 @@ module.exports = async function handler(req, res) {
             : price;
         const newPeak = Math.max(pos.peak_price || price, price);
 
+        // Deduct spend from the shared pool.
+        sharedCash -= spendGbp;
+        await supabase
+          .from("risk_state")
+          .update({ shared_cash_gbp: sharedCash })
+          .eq("id", 1);
+
         await supabase
           .from("trading_positions")
           .update({
-            cash_gbp: pos.cash_gbp - spendGbp,
             base_size: newBaseSize,
             in_position: true,
             entry_price: newEntryPrice,
@@ -516,7 +548,7 @@ module.exports = async function handler(req, res) {
       }
     }
 
-    return res.status(200).json({ ok: true, haltedToday, totalCapitalNow, results });
+    return res.status(200).json({ ok: true, haltedToday, totalCapitalNow, sharedCashPool: sharedCash, results });
   } catch (err) {
     return res.status(500).json({ ok: false, error: String(err) });
   }
