@@ -168,8 +168,8 @@
   // These are safe to expose publicly — the anon/public key, combined with
   // the read-only RLS policies in schema.sql, only allows SELECT queries.
   // It cannot insert, update, delete, or place trades.
-  const SUPABASE_URL = "REPLACE_WITH_YOUR_SUPABASE_URL";
-  const SUPABASE_ANON_KEY = "REPLACE_WITH_YOUR_SUPABASE_ANON_KEY";
+  const SUPABASE_URL = "https://enwitxdehukxdgujruhu.supabase.co";
+  const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImVud2l0eGRlaHVreGRndWpydWh1Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQ1NjIxMjEsImV4cCI6MjEwMDEzODEyMX0.DPbumyhG2Jj5wTcT5-PrLFkmc0Ecpyp6EuewcpgBujQ";
 
   const client = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
