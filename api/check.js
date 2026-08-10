@@ -14,6 +14,16 @@ const COOLDOWN_MS = 30 * 60 * 1000; // 30 minutes
 const MAX_SIMULTANEOUS_TRADES = 5;
 const RISK_PER_TRADE_PCT = 0.02; // 2% of total capital
 
+// Coinbase charges a taker fee on both the buy and the sell side of a trade
+// (~0.6% each at the lowest volume tier — check your actual fee tier at
+// coinbase.com/advanced-fees, as this varies). That's roughly 1.2% lost to
+// fees on a full round trip. Small profit-skims (e.g. a few pence) were
+// very likely losing money after fees despite showing as a "successful"
+// trade. These two settings stop that:
+const COINBASE_TAKER_FEE_PCT = 0.006; // ~0.6% per side — verify against your account's real tier
+const MIN_PROFIT_AFTER_FEES_PCT = 0.015; // require >=1.5% gain before taking profit (covers ~1.2% round-trip fee plus a margin)
+const MIN_TRADE_SIZE_GBP = 3; // skip trades this small — fees take too large a bite proportionally
+
 // Shared cash pool model: one pot of GBP (stored in risk_state.shared_cash_gbp)
 // funds buys of ANY coin, and profit-skims flow back into it. To avoid the
 // pool being drained into a single coin, each buy is capped to a fraction of
@@ -275,6 +285,20 @@ module.exports = async function handler(req, res) {
             }
           }
 
+          // Fee-awareness gate: a profit-taking trigger (not a protective
+          // stop-loss) only proceeds if the gain actually clears Coinbase's
+          // round-trip fee cost with a margin. Otherwise the trade is very
+          // likely a net loss once fees are factored in, even though it
+          // looks like a "successful" profit-taking sell. We just hold and
+          // wait for either a bigger gain or a genuine stop-loss instead.
+          if (shouldSell && !isProtectiveExit) {
+            const gainPct = (price - pos.entry_price) / pos.entry_price;
+            if (gainPct < MIN_PROFIT_AFTER_FEES_PCT) {
+              shouldSell = false;
+              reasoning = `${reasoning} [skipped: gain of ${(gainPct * 100).toFixed(2)}% doesn't clear the ~${(MIN_PROFIT_AFTER_FEES_PCT * 100).toFixed(1)}% needed to cover round-trip fees — holding for a bigger move instead]`;
+            }
+          }
+
           if (pos.last_regime === "MOMENTUM") {
             await supabase
               .from("trading_positions")
@@ -309,7 +333,19 @@ module.exports = async function handler(req, res) {
             const baseIncrement = await getBaseIncrement(pos.product_id);
             sellBaseSize = roundToIncrement(sellBaseSize, baseIncrement);
 
-            if (sellBaseSize <= 0) {
+            // Skip tiny profit-skims below our minimum trade size — fees
+            // take too large a bite of a very small trade. This does NOT
+            // apply to protective stop-loss exits, which must always fully
+            // execute regardless of size to actually protect your capital.
+            if (!isProtectiveExit && sellBaseSize * price < MIN_TRADE_SIZE_GBP) {
+              await logAndPush({
+                action: "SELL",
+                status: "skipped",
+                price,
+                regime: pos.last_regime,
+                reasoning: `${reasoning} [profit portion (£${(sellBaseSize * price).toFixed(2)}) is below the £${MIN_TRADE_SIZE_GBP} minimum trade size — holding for a bigger skim instead]`,
+              });
+            } else if (sellBaseSize <= 0) {
               await logAndPush({
                 action: "SELL",
                 status: "skipped",
@@ -473,7 +509,7 @@ module.exports = async function handler(req, res) {
         const capGbp = sharedCash * capPct;
         const spendGbp = Math.min(sharedCash, riskBasedSizeGbp, capGbp);
 
-        if (spendGbp < 1) {
+        if (spendGbp < MIN_TRADE_SIZE_GBP) {
           await logAndPush({
             action: "SKIP",
             status: "skipped",
