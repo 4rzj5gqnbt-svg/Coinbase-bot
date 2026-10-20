@@ -20,7 +20,10 @@ const RISK_PER_TRADE_PCT = 0.02; // 2% of total capital
 // fees on a full round trip. Small profit-skims (e.g. a few pence) were
 // very likely losing money after fees despite showing as a "successful"
 // trade. These two settings stop that:
-const COINBASE_TAKER_FEE_PCT = 0.006; // ~0.6% per side — verify against your account's real tier
+// Measured from this account's own reconciliations (Jul–Oct 2026): every buy
+// delivered ~1.2% less coin than spend/price, so the real taker fee is ~1.2%
+// per side (~2.4% round trip), not 0.6%.
+const COINBASE_TAKER_FEE_PCT = 0.012;
 const MIN_PROFIT_AFTER_FEES_PCT = 0.015; // require >=1.5% gain before taking profit (covers ~1.2% round-trip fee plus a margin)
 const MIN_TRADE_SIZE_GBP = 3; // skip trades this small — fees take too large a bite proportionally
 
@@ -330,6 +333,12 @@ module.exports = async function handler(req, res) {
               sellType = "partial (profit only, principal kept invested)";
             }
 
+            // Never ask Coinbase to sell more than is actually available.
+            // The bot's ledger can run slightly ahead of reality (buy fees
+            // come out of the coin received), and a full stop-loss sell of
+            // the ledger amount was being rejected with INSUFFICIENT_FUND
+            // every hour — so the stop-loss never actually fired.
+            sellBaseSize = Math.min(sellBaseSize, actualBalance);
             const baseIncrement = await getBaseIncrement(pos.product_id);
             sellBaseSize = roundToIncrement(sellBaseSize, baseIncrement);
 
@@ -369,8 +378,10 @@ module.exports = async function handler(req, res) {
                   detail: `Order rejected by Coinbase, position left unchanged: ${JSON.stringify(order.error_response || order)}`,
                 });
               } else {
-                const proceedsGbp = sellBaseSize * price;
-                const remainingBaseSize = pos.base_size - sellBaseSize;
+                // Coinbase takes its fee out of the GBP proceeds, so credit
+                // the pool with what actually arrives, not the gross amount.
+                const proceedsGbp = sellBaseSize * price * (1 - COINBASE_TAKER_FEE_PCT);
+                const remainingBaseSize = Math.max(0, Math.min(pos.base_size, actualBalance) - sellBaseSize);
                 const stillHolding = remainingBaseSize * price > DUST_THRESHOLD_GBP;
 
                 // Proceeds flow into the SHARED pool, not a per-coin pot —
@@ -534,14 +545,16 @@ module.exports = async function handler(req, res) {
           continue; // do NOT update position state — nothing was actually bought
         }
 
-        const approxBaseSize = spendGbp / price;
+        // The fee is taken out of the coin received, so record the net amount.
+        const approxBaseSize = (spendGbp * (1 - COINBASE_TAKER_FEE_PCT)) / price;
         const newBaseSize = pos.base_size + approxBaseSize;
         // If already holding some, blend entry price (weighted average);
         // otherwise this is a fresh entry.
+        // Cost basis includes the fee (spendGbp is what actually left the pool).
         const newEntryPrice =
           pos.base_size > 0 && pos.entry_price
-            ? (pos.entry_price * pos.base_size + price * approxBaseSize) / newBaseSize
-            : price;
+            ? (pos.entry_price * pos.base_size + spendGbp) / newBaseSize
+            : spendGbp / approxBaseSize;
         const newPeak = Math.max(pos.peak_price || price, price);
 
         // Deduct spend from the shared pool.
