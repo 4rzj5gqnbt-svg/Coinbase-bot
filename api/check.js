@@ -1,4 +1,16 @@
-const { getSpotPrice, listAccounts, marketSell, marketBuy, getCandles, getBaseIncrement, roundToIncrement } = require("../lib/coinbase");
+const {
+  getSpotPrice,
+  listAccounts,
+  marketSell,
+  getCandles,
+  roundToIncrement,
+  roundUpToIncrement,
+  getProduct,
+  getBestBidAsk,
+  limitOrderPostOnly,
+  getOrder,
+  cancelOrders,
+} = require("../lib/coinbase");
 const { getSupabase } = require("../lib/supabase");
 const {
   sma,
@@ -21,6 +33,15 @@ const RISK_PER_TRADE_PCT = 0.02; // 2% of total capital
 // delivered ~1.2% less coin than spend/price, so the real taker fee is ~1.2%
 // per side (~2.4% round trip), not 0.6%.
 const COINBASE_TAKER_FEE_PCT = 0.012;
+// Buys and profit-taking now use post-only LIMIT orders, which pay the lower
+// maker fee. Stop-losses stay as MARKET orders so they always execute.
+const COINBASE_MAKER_FEE_PCT = 0.006;
+// A limit order that hasn't filled after this long is cancelled on the next
+// run; the signal is re-checked from scratch after that.
+const PENDING_ORDER_MAX_AGE_MS = 50 * 60 * 1000;
+const TERMINAL_ORDER_STATUSES = ["FILLED", "CANCELLED", "EXPIRED", "FAILED"];
+// Holdings worth less than this are treated as leftover dust, not a position.
+const DUST_THRESHOLD_GBP = 0.05;
 const MIN_PROFIT_AFTER_FEES_PCT = 0.03; // require >=3% gain before taking profit (covers the real ~2.4% round-trip fee plus a margin)
 const MIN_TRADE_SIZE_GBP = 3; // skip trades this small — fees take too large a bite proportionally
 
@@ -80,11 +101,21 @@ module.exports = async function handler(req, res) {
       (sum, p) => sum + p.base_size * (pricesNow[p.product_id] || 0),
       0
     );
-    // Shared pool is added below once it's loaded from risk_state.
-    let totalCapitalNow = positionsValue;
+    // Cash reserved for limit buys that haven't filled yet is still your
+    // money — count it, or the daily-loss check would misread a reservation
+    // as a loss.
+    const reservedForPendingBuys = positions.reduce(
+      (sum, p) => sum + (p.pending_order_id && p.pending_side === "BUY" ? parseFloat(p.pending_quote_gbp || 0) : 0),
+      0
+    );
 
     let { data: riskRows } = await supabase.from("risk_state").select("*").eq("id", 1);
     let risk = riskRows && riskRows[0];
+    // Total capital = coins + shared cash pool + reserved cash. (Previously the
+    // day's starting capital left out the cash pool, so the 5% daily loss
+    // limit could effectively never trigger.)
+    let totalCapitalNow =
+      positionsValue + parseFloat((risk && risk.shared_cash_gbp) || 0) + reservedForPendingBuys;
     const today = new Date().toISOString().slice(0, 10);
     if (!risk || risk.day !== today) {
       risk = {
@@ -100,7 +131,6 @@ module.exports = async function handler(req, res) {
     }
     // Live handle on the shared pool for this run.
     let sharedCash = parseFloat(risk.shared_cash_gbp || 0);
-    totalCapitalNow += sharedCash;
     const drawdownPct =
       risk.day_start_capital_gbp > 0
         ? (risk.day_start_capital_gbp - totalCapitalNow) / risk.day_start_capital_gbp
@@ -124,6 +154,149 @@ module.exports = async function handler(req, res) {
       try {
         const price = pricesNow[pos.product_id];
 
+        // ============= RESOLVE ANY LIMIT ORDER FROM AN EARLIER RUN =============
+        const clearPending = {
+          pending_order_id: null,
+          pending_side: null,
+          pending_base_size: null,
+          pending_limit_price: null,
+          pending_quote_gbp: null,
+          pending_placed_at: null,
+          pending_reasoning: null,
+          pending_regime: null,
+        };
+
+        // Book whatever part of a finished limit order actually filled, using
+        // Coinbase's real fill size, price and fee (not estimates).
+        const applyFinishedOrder = async (order) => {
+          const filledBase = parseFloat(order.filled_size || 0);
+          const filledValue = parseFloat(order.filled_value || 0);
+          const fees = parseFloat(order.total_fees || 0);
+          const avgPrice =
+            parseFloat(order.average_filled_price || 0) || parseFloat(pos.pending_limit_price || price);
+          const partial = order.status !== "FILLED" ? " (partly filled before cancelling)" : "";
+          const nowIso = new Date().toISOString();
+          let update = { ...clearPending };
+
+          if (pos.pending_side === "BUY") {
+            const reserved = parseFloat(pos.pending_quote_gbp || 0);
+            const cost = filledBase > 0 ? filledValue + fees : 0;
+            sharedCash += reserved - cost; // hand back whatever part of the reservation wasn't spent
+            if (filledBase > 0) {
+              const newBase = (pos.base_size || 0) + filledBase;
+              const newEntry =
+                pos.base_size > 0 && pos.entry_price
+                  ? (pos.entry_price * pos.base_size + cost) / newBase
+                  : cost / filledBase;
+              const newPeak = Math.max(pos.peak_price || avgPrice, avgPrice);
+              const newRegime = pos.pending_regime || pos.last_regime;
+              update = {
+                ...update,
+                base_size: newBase,
+                in_position: true,
+                entry_price: newEntry,
+                peak_price: newPeak,
+                last_regime: newRegime,
+                last_trade_at: nowIso,
+              };
+              await logAndPush({
+                action: "BUY",
+                status: "success",
+                price: avgPrice,
+                regime: newRegime,
+                amount_gbp: cost,
+                base_size: filledBase,
+                coinbase_order_id: pos.pending_order_id,
+                reasoning: `${pos.pending_reasoning || ""} [limit buy filled${partial}: ${filledBase} at avg ${avgPrice}, maker fee £${fees.toFixed(4)}]`,
+                detail: JSON.stringify(order),
+              });
+              Object.assign(pos, update);
+            } else {
+              await logAndPush({
+                action: "BUY",
+                status: "expired",
+                price,
+                regime: pos.pending_regime,
+                coinbase_order_id: pos.pending_order_id,
+                reasoning: `Limit buy at ${pos.pending_limit_price} was cancelled before it filled — £${reserved.toFixed(2)} back in the cash pool. The signal will be re-checked from scratch.`,
+              });
+            }
+          } else {
+            if (filledBase > 0) {
+              const proceeds = filledValue - fees;
+              sharedCash += proceeds;
+              const remaining = Math.max(0, (pos.base_size || 0) - filledBase);
+              const stillHolding = remaining * price > DUST_THRESHOLD_GBP;
+              update = {
+                ...update,
+                base_size: stillHolding ? remaining : 0,
+                in_position: stillHolding,
+                // Keep the original cost basis for what's left after a skim.
+                entry_price: stillHolding ? pos.entry_price : null,
+                // Trailing stop measures the next climb from here.
+                peak_price: stillHolding ? avgPrice : null,
+                last_trade_at: nowIso,
+              };
+              await logAndPush({
+                action: "SELL",
+                status: "success",
+                price: avgPrice,
+                regime: pos.pending_regime || pos.last_regime,
+                amount_gbp: proceeds,
+                base_size: filledBase,
+                coinbase_order_id: pos.pending_order_id,
+                reasoning: `${pos.pending_reasoning || ""} [limit sell filled${partial}: ${filledBase} at avg ${avgPrice}, maker fee £${fees.toFixed(4)}, kept ${remaining.toFixed(8)} invested]`,
+                detail: JSON.stringify(order),
+              });
+              Object.assign(pos, update);
+            } else {
+              await logAndPush({
+                action: "SELL",
+                status: "expired",
+                price,
+                regime: pos.pending_regime || pos.last_regime,
+                coinbase_order_id: pos.pending_order_id,
+                reasoning: `Limit sell at ${pos.pending_limit_price} was cancelled before it filled. Coins stay invested; the signal will be re-checked.`,
+              });
+            }
+          }
+
+          await supabase.from("trading_positions").update(update).eq("product_id", pos.product_id);
+          await supabase.from("risk_state").update({ shared_cash_gbp: sharedCash }).eq("id", 1);
+          Object.assign(pos, clearPending);
+        };
+
+        // Check the open limit order; cancel it if it's too old (or when a
+        // stop-loss needs the coins). Returns true if it's STILL open after.
+        const resolvePendingOrder = async ({ forceCancel = false } = {}) => {
+          if (!pos.pending_order_id) return false;
+          let order = await getOrder(pos.pending_order_id);
+          const ageMs = Date.now() - new Date(pos.pending_placed_at).getTime();
+          if (!TERMINAL_ORDER_STATUSES.includes(order.status) && (forceCancel || ageMs > PENDING_ORDER_MAX_AGE_MS)) {
+            await cancelOrders([pos.pending_order_id]);
+            order = await getOrder(pos.pending_order_id);
+          }
+          if (!TERMINAL_ORDER_STATUSES.includes(order.status)) {
+            if (ageMs > 6 * 3600 * 1000) {
+              await logAndPush({
+                action: "ERROR",
+                status: "error",
+                price,
+                detail: `Limit order ${pos.pending_order_id} still not finished after ${(ageMs / 3600000).toFixed(1)}h (status ${order.status}) — check it in Coinbase.`,
+              });
+            }
+            return true;
+          }
+          await applyFinishedOrder(order);
+          return false;
+        };
+
+        // While a coin has (or just had) a limit order, its Coinbase balance is
+        // partly on hold or just changed, so we don't reconcile it or place new
+        // orders for it this run. Only a stop-loss may still act.
+        const hadPendingOrder = !!pos.pending_order_id;
+        let pendingOpen = hadPendingOrder ? await resolvePendingOrder() : false;
+
         // Reconcile with your ACTUAL Coinbase balance. If you manually
         // bought/sold this coin outside the bot (e.g. via the Coinbase
         // app), the bot's own ledger (base_size) would otherwise be stale
@@ -136,7 +309,7 @@ module.exports = async function handler(req, res) {
         const balanceDiff = Math.abs(actualBalance - trackedBalance);
         const balanceMismatch = balanceDiff > trackedBalance * 0.002 + 0.00000001; // >0.2% relative (was 1%, which let fee drift pile up unnoticed), plus a tiny absolute floor for dust/rounding
 
-        if (balanceMismatch) {
+        if (balanceMismatch && !hadPendingOrder) {
           const wasInPosition = pos.in_position;
           pos.base_size = actualBalance;
           pos.in_position = actualBalance > 0;
@@ -233,7 +406,7 @@ module.exports = async function handler(req, res) {
         // ever checking buy conditions again, leaving cash stuck idle
         // forever. This was a real bug: coins never returned to a
         // buyable/"watching" state once any tiny fraction remained.
-        const DUST_THRESHOLD_GBP = 0.05;
+        // (DUST_THRESHOLD_GBP is defined at the top of the file.)
         const holdingValueGbp = pos.base_size * price;
         const hasMeaningfulHolding = holdingValueGbp > DUST_THRESHOLD_GBP;
 
@@ -323,55 +496,61 @@ module.exports = async function handler(req, res) {
               regime: pos.last_regime,
               reasoning: "No exit condition met.",
             });
-          } else {
-            // Full exit ONLY on a genuine protective stop-loss. Every other
-            // trigger is profit-taking: skim the gain, keep the principal
-            // invested so it keeps riding the coin.
-            let sellBaseSize;
-            let sellType;
-            if (isProtectiveExit) {
-              sellBaseSize = pos.base_size;
-              sellType = "full exit (stop-loss — protecting capital)";
-            } else {
-              const profitGbp = pos.base_size * Math.max(0, price - pos.entry_price);
-              sellBaseSize = profitGbp / price;
-              sellType = "partial (profit only, principal kept invested)";
+          } else if (!isProtectiveExit && hadPendingOrder) {
+            // A limit order for this coin is open or only just finished —
+            // its balance is in flux, so wait for the next run before
+            // placing another profit-taking order.
+            await logAndPush({
+              action: "SELL",
+              status: "skipped",
+              price,
+              regime: pos.last_regime,
+              reasoning: `${reasoning} [waiting: a limit order for this coin is open or just finished — re-checking next run]`,
+            });
+          } else if (isProtectiveExit) {
+            // ---------- STOP-LOSS: always a MARKET order ----------
+            // If a limit order is still open it may be holding the coins, so
+            // cancel it first and book any part that filled.
+            let available = actualBalance;
+            if (pendingOpen) {
+              pendingOpen = await resolvePendingOrder({ forceCancel: true });
+            }
+            if (pendingOpen) {
+              await logAndPush({
+                action: "SELL",
+                status: "error",
+                price,
+                regime: pos.last_regime,
+                reasoning: `${reasoning} [full exit (stop-loss)]`,
+                detail: "Stop-loss waiting: couldn't cancel the open limit order yet — will retry next run.",
+              });
+              continue;
+            }
+            if (hadPendingOrder) {
+              // Balance changed during this run — fetch it fresh.
+              const fresh = (await listAccounts()).find((a) => a.currency === pos.base_currency);
+              available = fresh ? parseFloat(fresh.available_balance.value) : 0;
             }
 
             // Never ask Coinbase to sell more than is actually available.
-            // The bot's ledger can run slightly ahead of reality (buy fees
-            // come out of the coin received), and a full stop-loss sell of
-            // the ledger amount was being rejected with INSUFFICIENT_FUND
-            // every hour — so the stop-loss never actually fired.
-            sellBaseSize = Math.min(sellBaseSize, actualBalance);
-            const baseIncrement = await getBaseIncrement(pos.product_id);
-            sellBaseSize = roundToIncrement(sellBaseSize, baseIncrement);
+            // The bot's ledger can run slightly ahead of reality, and a full
+            // stop-loss sell of the ledger amount was being rejected with
+            // INSUFFICIENT_FUND every hour — so the stop-loss never fired.
+            const product = await getProduct(pos.product_id);
+            const baseIncrement = parseFloat(product.base_increment);
+            const sellBaseSize = roundToIncrement(Math.min(pos.base_size, available), baseIncrement);
+            const sellType = "full exit (stop-loss — protecting capital)";
 
-            // Skip tiny profit-skims below our minimum trade size — fees
-            // take too large a bite of a very small trade. This does NOT
-            // apply to protective stop-loss exits, which must always fully
-            // execute regardless of size to actually protect your capital.
-            if (!isProtectiveExit && sellBaseSize * price < MIN_TRADE_SIZE_GBP) {
+            if (sellBaseSize <= 0) {
               await logAndPush({
                 action: "SELL",
                 status: "skipped",
                 price,
                 regime: pos.last_regime,
-                reasoning: `${reasoning} [profit portion (£${(sellBaseSize * price).toFixed(2)}) is below the £${MIN_TRADE_SIZE_GBP} minimum trade size — holding for a bigger skim instead]`,
-              });
-            } else if (sellBaseSize <= 0) {
-              await logAndPush({
-                action: "SELL",
-                status: "skipped",
-                price,
-                regime: pos.last_regime,
-                reasoning: `${reasoning} [profit portion rounds to 0 at this coin's minimum order precision — nothing to sell yet]`,
+                reasoning: `${reasoning} [nothing available to sell at this coin's order precision]`,
               });
             } else {
-              const order = await marketSell({
-                productId: pos.product_id,
-                baseSize: sellBaseSize,
-              });
+              const order = await marketSell({ productId: pos.product_id, baseSize: sellBaseSize });
 
               if (order.success === false) {
                 await logAndPush({
@@ -383,15 +562,10 @@ module.exports = async function handler(req, res) {
                   detail: `Order rejected by Coinbase, position left unchanged: ${JSON.stringify(order.error_response || order)}`,
                 });
               } else {
-                // Coinbase takes its fee out of the GBP proceeds, so credit
-                // the pool with what actually arrives, not the gross amount.
+                // Market orders pay the taker fee out of the GBP proceeds.
                 const proceedsGbp = sellBaseSize * price * (1 - COINBASE_TAKER_FEE_PCT);
-                const remainingBaseSize = Math.max(0, Math.min(pos.base_size, actualBalance) - sellBaseSize);
+                const remainingBaseSize = Math.max(0, Math.min(pos.base_size, available) - sellBaseSize);
                 const stillHolding = remainingBaseSize * price > DUST_THRESHOLD_GBP;
-
-                // Proceeds flow into the SHARED pool, not a per-coin pot —
-                // so profit skimmed from one coin's climb can fund a buy of
-                // any coin next time a signal fires.
                 sharedCash += proceedsGbp;
 
                 await supabase
@@ -399,24 +573,13 @@ module.exports = async function handler(req, res) {
                   .update({
                     base_size: stillHolding ? remainingBaseSize : 0,
                     in_position: stillHolding,
-                    // Keep the ORIGINAL entry price when we've only skimmed
-                    // profit — it's still the true cost basis for what's
-                    // left. Only clear it when the position is fully closed.
                     entry_price: stillHolding ? pos.entry_price : null,
-                    // Reset the peak so the trailing stop measures the next
-                    // climb from here rather than from an old high we've
-                    // already taken profit on.
                     peak_price: stillHolding ? price : null,
                     last_trade_at: new Date().toISOString(),
                   })
                   .eq("product_id", pos.product_id);
+                await supabase.from("risk_state").update({ shared_cash_gbp: sharedCash }).eq("id", 1);
 
-                await supabase
-                  .from("risk_state")
-                  .update({ shared_cash_gbp: sharedCash })
-                  .eq("id", 1);
-
-                // Keep our in-memory copy in sync for the buy-check below.
                 pos.base_size = stillHolding ? remainingBaseSize : 0;
                 pos.in_position = stillHolding;
 
@@ -428,10 +591,101 @@ module.exports = async function handler(req, res) {
                   amount_gbp: proceedsGbp,
                   base_size: sellBaseSize,
                   coinbase_order_id: order?.success_response?.order_id || null,
-                  reasoning: `${reasoning} [${sellType} — sold ${sellBaseSize.toFixed(8)} of ${(remainingBaseSize + sellBaseSize).toFixed(8)}, kept ${remainingBaseSize.toFixed(8)} invested]`,
+                  reasoning: `${reasoning} [${sellType}, market order — sold ${sellBaseSize.toFixed(8)}, kept ${remainingBaseSize.toFixed(8)}]`,
                   detail: JSON.stringify(order),
                 });
                 sellExecutedThisCycle = true;
+              }
+            }
+          } else {
+            // ---------- PROFIT-TAKING: post-only LIMIT order (maker fee) ----------
+            // Skim only the gain, keep the principal invested.
+            const product = await getProduct(pos.product_id);
+            const baseIncrement = parseFloat(product.base_increment);
+            const priceIncrement = parseFloat(product.price_increment || product.quote_increment);
+            const baseMin = parseFloat(product.base_min_size || 0);
+            const profitGbp = pos.base_size * Math.max(0, price - pos.entry_price);
+            const sellBaseSize = roundToIncrement(Math.min(profitGbp / price, actualBalance), baseIncrement);
+
+            if (sellBaseSize * price < MIN_TRADE_SIZE_GBP) {
+              await logAndPush({
+                action: "SELL",
+                status: "skipped",
+                price,
+                regime: pos.last_regime,
+                reasoning: `${reasoning} [profit portion (£${(sellBaseSize * price).toFixed(2)}) is below the £${MIN_TRADE_SIZE_GBP} minimum trade size — holding for a bigger skim instead]`,
+              });
+            } else if (sellBaseSize <= 0 || sellBaseSize < baseMin) {
+              await logAndPush({
+                action: "SELL",
+                status: "skipped",
+                price,
+                regime: pos.last_regime,
+                reasoning: `${reasoning} [profit portion is below Coinbase's minimum order size for this coin — nothing to sell yet]`,
+              });
+            } else {
+              // Sit at the best ask (the lowest current seller) so the order
+              // rests on the book and pays the maker fee.
+              const { ask } = await getBestBidAsk(pos.product_id);
+              const limitPrice = roundUpToIncrement(ask || price, priceIncrement);
+              const order = await limitOrderPostOnly({
+                productId: pos.product_id,
+                side: "SELL",
+                baseSize: sellBaseSize,
+                limitPrice,
+                baseIncrement,
+                priceIncrement,
+              });
+
+              if (order.success === false) {
+                await logAndPush({
+                  action: "SELL",
+                  status: "error",
+                  price,
+                  regime: pos.last_regime,
+                  reasoning: `${reasoning} [profit skim, limit order]`,
+                  detail: `Limit order rejected by Coinbase, position left unchanged: ${JSON.stringify(order.error_response || order)}`,
+                });
+              } else {
+                const orderId = order?.success_response?.order_id || null;
+                const pendingFields = {
+                  pending_order_id: orderId,
+                  pending_side: "SELL",
+                  pending_base_size: sellBaseSize,
+                  pending_limit_price: limitPrice,
+                  pending_quote_gbp: 0,
+                  pending_placed_at: new Date().toISOString(),
+                  pending_reasoning: `${reasoning} [partial (profit only, principal kept invested)]`,
+                  pending_regime: pos.last_regime,
+                };
+                // If the bot can't record the order, cancel it — an order the
+                // bot doesn't know about could be placed twice.
+                const { error: saveErr } = await supabase
+                  .from("trading_positions")
+                  .update(pendingFields)
+                  .eq("product_id", pos.product_id);
+                if (saveErr) {
+                  await cancelOrders([orderId]);
+                  await logAndPush({
+                    action: "ERROR",
+                    status: "error",
+                    price,
+                    detail: `Couldn't record limit sell ${orderId} in the database (${saveErr.message}) — cancelled it to be safe.`,
+                  });
+                  continue;
+                }
+                Object.assign(pos, pendingFields);
+                await logAndPush({
+                  action: "SELL",
+                  status: "pending",
+                  price: limitPrice,
+                  regime: pos.last_regime,
+                  base_size: sellBaseSize,
+                  coinbase_order_id: orderId,
+                  reasoning: `${reasoning} [limit sell placed: ${sellBaseSize} at ${limitPrice} — books when it fills, cancelled if not filled within ~1 hour]`,
+                  detail: JSON.stringify(order),
+                });
+                sellExecutedThisCycle = true; // don't also try to buy this coin in the same run
               }
             }
           }
@@ -443,6 +697,18 @@ module.exports = async function handler(req, res) {
         // if we just sold this same coin this cycle (avoid buying straight
         // back into what we just sold in the same run).
         if (sellExecutedThisCycle) {
+          continue;
+        }
+        if (hadPendingOrder) {
+          await logAndPush({
+            action: "SKIP",
+            status: "skipped",
+            price,
+            regime,
+            reasoning: pendingOpen
+              ? "Limit order still open for this coin — waiting for it to fill or be cancelled."
+              : "Limit order for this coin just finished — buy checks resume next run.",
+          });
           continue;
         }
         if (haltedToday) {
@@ -567,7 +833,36 @@ module.exports = async function handler(req, res) {
           continue;
         }
 
-        const order = await marketBuy({ productId: pos.product_id, quoteSize: spendGbp });
+        // ---------- BUY: post-only LIMIT order at the best bid (maker fee) ----------
+        const product = await getProduct(pos.product_id);
+        const baseIncrement = parseFloat(product.base_increment);
+        const priceIncrement = parseFloat(product.price_increment || product.quote_increment);
+        const baseMin = parseFloat(product.base_min_size || 0);
+        const { bid } = await getBestBidAsk(pos.product_id);
+        const limitPrice = roundToIncrement(bid || price, priceIncrement);
+        // Size the order so coins + maker fee fit inside the spend budget.
+        const buyBaseSize = roundToIncrement(spendGbp / (limitPrice * (1 + COINBASE_MAKER_FEE_PCT)), baseIncrement);
+        const reserveGbp = buyBaseSize * limitPrice * (1 + COINBASE_MAKER_FEE_PCT);
+
+        if (buyBaseSize <= 0 || buyBaseSize < baseMin) {
+          await logAndPush({
+            action: "SKIP",
+            status: "skipped",
+            price,
+            regime,
+            reasoning: `Buy signal, but £${spendGbp.toFixed(2)} is below Coinbase's minimum order size for this coin — skipping. Signal was: ${reasoning}`,
+          });
+          continue;
+        }
+
+        const order = await limitOrderPostOnly({
+          productId: pos.product_id,
+          side: "BUY",
+          baseSize: buyBaseSize,
+          limitPrice,
+          baseIncrement,
+          priceIncrement,
+        });
 
         if (order.success === false) {
           await logAndPush({
@@ -576,51 +871,54 @@ module.exports = async function handler(req, res) {
             price,
             regime,
             reasoning,
-            detail: `Order rejected by Coinbase, no cash was spent: ${JSON.stringify(order.error_response || order)}`,
+            detail: `Limit order rejected by Coinbase, no cash was spent: ${JSON.stringify(order.error_response || order)}`,
           });
-          continue; // do NOT update position state — nothing was actually bought
+          continue; // nothing placed, nothing reserved
         }
 
-        // The fee is taken out of the coin received, so record the net amount.
-        const approxBaseSize = (spendGbp * (1 - COINBASE_TAKER_FEE_PCT)) / price;
-        const newBaseSize = pos.base_size + approxBaseSize;
-        // If already holding some, blend entry price (weighted average);
-        // otherwise this is a fresh entry.
-        // Cost basis includes the fee (spendGbp is what actually left the pool).
-        const newEntryPrice =
-          pos.base_size > 0 && pos.entry_price
-            ? (pos.entry_price * pos.base_size + spendGbp) / newBaseSize
-            : spendGbp / approxBaseSize;
-        const newPeak = Math.max(pos.peak_price || price, price);
-
-        // Deduct spend from the shared pool.
-        sharedCash -= spendGbp;
-        await supabase
-          .from("risk_state")
-          .update({ shared_cash_gbp: sharedCash })
-          .eq("id", 1);
-
-        await supabase
+        const orderId = order?.success_response?.order_id || null;
+        const pendingFields = {
+          pending_order_id: orderId,
+          pending_side: "BUY",
+          pending_base_size: buyBaseSize,
+          pending_limit_price: limitPrice,
+          pending_quote_gbp: reserveGbp,
+          pending_placed_at: new Date().toISOString(),
+          pending_reasoning: reasoning,
+          pending_regime: regime,
+        };
+        // If the bot can't record the order, cancel it — an order the bot
+        // doesn't know about could be placed twice.
+        const { error: saveErr } = await supabase
           .from("trading_positions")
-          .update({
-            base_size: newBaseSize,
-            in_position: true,
-            entry_price: newEntryPrice,
-            peak_price: newPeak,
-            last_regime: regime,
-            last_trade_at: new Date().toISOString(),
-          })
+          .update(pendingFields)
           .eq("product_id", pos.product_id);
+        if (saveErr) {
+          await cancelOrders([orderId]);
+          await logAndPush({
+            action: "ERROR",
+            status: "error",
+            price,
+            detail: `Couldn't record limit buy ${orderId} in the database (${saveErr.message}) — cancelled it to be safe.`,
+          });
+          continue;
+        }
+        Object.assign(pos, pendingFields);
+
+        // Reserve the cash now (Coinbase holds it while the order is open);
+        // whatever isn't spent goes back into the pool when the order finishes.
+        sharedCash -= reserveGbp;
+        await supabase.from("risk_state").update({ shared_cash_gbp: sharedCash }).eq("id", 1);
 
         await logAndPush({
           action: "BUY",
-          status: "success",
-          price,
+          status: "pending",
+          price: limitPrice,
           regime,
-          amount_gbp: spendGbp,
-          base_size: approxBaseSize,
-          coinbase_order_id: order?.success_response?.order_id || null,
-          reasoning,
+          amount_gbp: reserveGbp,
+          base_size: buyBaseSize,
+          coinbase_order_id: orderId,
+          reasoning: `${reasoning} [limit buy placed: ${buyBaseSize} at ${limitPrice} (£${reserveGbp.toFixed(2)} reserved) — books when it fills, cancelled if not filled within ~1 hour]`,
           detail: JSON.stringify(order),
         });
       } catch (innerErr) {
