@@ -15,16 +15,13 @@ const MAX_SIMULTANEOUS_TRADES = 5;
 const RISK_PER_TRADE_PCT = 0.02; // 2% of total capital
 
 // Coinbase charges a taker fee on both the buy and the sell side of a trade
-// (~0.6% each at the lowest volume tier — check your actual fee tier at
-// coinbase.com/advanced-fees, as this varies). That's roughly 1.2% lost to
-// fees on a full round trip. Small profit-skims (e.g. a few pence) were
-// very likely losing money after fees despite showing as a "successful"
-// trade. These two settings stop that:
+// (check your tier at coinbase.com/advanced-fees). Small profit-skims were
+// very likely losing money after fees despite showing as "successful".
 // Measured from this account's own reconciliations (Jul–Oct 2026): every buy
 // delivered ~1.2% less coin than spend/price, so the real taker fee is ~1.2%
 // per side (~2.4% round trip), not 0.6%.
 const COINBASE_TAKER_FEE_PCT = 0.012;
-const MIN_PROFIT_AFTER_FEES_PCT = 0.015; // require >=1.5% gain before taking profit (covers ~1.2% round-trip fee plus a margin)
+const MIN_PROFIT_AFTER_FEES_PCT = 0.03; // require >=3% gain before taking profit (covers the real ~2.4% round-trip fee plus a margin)
 const MIN_TRADE_SIZE_GBP = 3; // skip trades this small — fees take too large a bite proportionally
 
 // Shared cash pool model: one pot of GBP (stored in risk_state.shared_cash_gbp)
@@ -38,17 +35,25 @@ const MOMENTUM_TRAILING_STOP_PCT = 0.025; // 2.5%
 const MEAN_REVERSION_TAKE_PROFIT_PCT = 0.04; // midpoint of 3-5%
 const MEAN_REVERSION_STOP_LOSS_PCT = 0.025; // 2-3% band, using 2.5%
 
-// Entry-condition thresholds — loosened from the original spec so the bot
-// finds more (lower-conviction) trades instead of sitting idle for long
-// stretches. Loosening these means more trades and more fee drag, and each
-// individual trade is less "confirmed" than the original stricter version.
-const MOMENTUM_ATR_MULTIPLE = 0.6; // was 1.2
-const MOMENTUM_VOLUME_MULTIPLE = 1.2; // was 1.5
-const MOMENTUM_RESISTANCE_PROXIMITY = 0.995; // was: must fully break above (1.0)
-const MEAN_REVERSION_ATR_MULTIPLE = 0.8; // was 1.5
-const MEAN_REVERSION_RSI_OVERSOLD = 40; // was 30
-const MEAN_REVERSION_VOLUME_MULTIPLE = 1.2; // was 1.5
-const MEAN_REVERSION_SUPPORT_PROXIMITY = 1.02; // was 1.01
+// Entry-condition thresholds — back to the ORIGINAL stricter spec (Oct 2026).
+// The loosened versions (0.6x ATR, 1.2x volume, etc.) produced more trades,
+// but Jul–Oct data showed the extra trading didn't beat simply holding and
+// often bought back near local tops. Fewer, better-confirmed entries instead.
+const MOMENTUM_ATR_MULTIPLE = 1.2; // loosened version was 0.6
+const MOMENTUM_VOLUME_MULTIPLE = 1.5; // loosened version was 1.2
+const MOMENTUM_RESISTANCE_PROXIMITY = 1.0; // must fully break above (loosened was 0.995)
+const MEAN_REVERSION_ATR_MULTIPLE = 1.5; // loosened version was 0.8
+const MEAN_REVERSION_RSI_OVERSOLD = 30; // loosened version was 40
+const MEAN_REVERSION_VOLUME_MULTIPLE = 1.5; // loosened version was 1.2
+const MEAN_REVERSION_SUPPORT_PROXIMITY = 1.01; // loosened version was 1.02
+
+// Anti-churn rules. The bot repeatedly sold a coin and then bought it back
+// higher within a day or two (e.g. ADA sold ~0.2048 on 5 Oct, rebought 0.209
+// on 6 Oct). After any successful sell of a coin:
+//  - no buying that coin again for REBUY_BLOCK_HOURS, and
+//  - until REBUY_BELOW_SELL_HOURS, only buy it back at or below the sell price.
+const REBUY_BLOCK_HOURS = 24;
+const REBUY_BELOW_SELL_HOURS = 72;
 
 module.exports = async function handler(req, res) {
   const auth = req.headers["authorization"];
@@ -129,7 +134,7 @@ module.exports = async function handler(req, res) {
         const actualBalance = account ? parseFloat(account.available_balance.value) : 0;
         const trackedBalance = pos.base_size || 0;
         const balanceDiff = Math.abs(actualBalance - trackedBalance);
-        const balanceMismatch = balanceDiff > trackedBalance * 0.01 + 0.00000001; // >1% relative, plus a tiny absolute floor for dust/rounding
+        const balanceMismatch = balanceDiff > trackedBalance * 0.002 + 0.00000001; // >0.2% relative (was 1%, which let fee drift pile up unnoticed), plus a tiny absolute floor for dust/rounding
 
         if (balanceMismatch) {
           const wasInPosition = pos.in_position;
@@ -485,7 +490,7 @@ module.exports = async function handler(req, res) {
           diagnostics = `move=${priceMove.toFixed(4)} (need>=${(MOMENTUM_ATR_MULTIPLE * atr1h).toFixed(4)}: ${bigEnoughMove}), volume=${currentVolume.toFixed(2)} (need>=${(MOMENTUM_VOLUME_MULTIPLE * avgVol).toFixed(2)}: ${volumeSpike}), price=${price} vs resistance*${MOMENTUM_RESISTANCE_PROXIMITY}=${(resistance * MOMENTUM_RESISTANCE_PROXIMITY).toFixed(4)} (${brokeResistance})`;
           if (bigEnoughMove && volumeSpike && brokeResistance) {
             shouldBuy = true;
-            reasoning = `Momentum breakout (loosened thresholds): +${priceMove.toFixed(4)} move (>=${MOMENTUM_ATR_MULTIPLE}x ATR ${atr1h.toFixed(4)}), volume ${currentVolume.toFixed(2)} >= ${MOMENTUM_VOLUME_MULTIPLE}x avg ${avgVol.toFixed(2)}, near/above resistance ${resistance.toFixed(4)}.`;
+            reasoning = `Momentum breakout: +${priceMove.toFixed(4)} move (>=${MOMENTUM_ATR_MULTIPLE}x ATR ${atr1h.toFixed(4)}), volume ${currentVolume.toFixed(2)} >= ${MOMENTUM_VOLUME_MULTIPLE}x avg ${avgVol.toFixed(2)}, near/above resistance ${resistance.toFixed(4)}.`;
           }
         } else {
           const priceDrop = prevCandle.close - price;
@@ -496,7 +501,7 @@ module.exports = async function handler(req, res) {
           diagnostics = `drop=${priceDrop.toFixed(4)} (need>=${(MEAN_REVERSION_ATR_MULTIPLE * atr1h).toFixed(4)}: ${bigEnoughDrop}), RSI=${rsi14?.toFixed(1)} (need<=${MEAN_REVERSION_RSI_OVERSOLD}: ${oversold}), volume=${currentVolume.toFixed(2)} (need>=${(MEAN_REVERSION_VOLUME_MULTIPLE * avgVol).toFixed(2)}: ${volumeSpike}), price=${price} vs support*${MEAN_REVERSION_SUPPORT_PROXIMITY}=${(support * MEAN_REVERSION_SUPPORT_PROXIMITY).toFixed(4)} (${nearSupport})`;
           if (bigEnoughDrop && oversold && volumeSpike && nearSupport) {
             shouldBuy = true;
-            reasoning = `Mean-reversion dip (loosened thresholds): -${priceDrop.toFixed(4)} drop (>=${MEAN_REVERSION_ATR_MULTIPLE}x ATR ${atr1h.toFixed(4)}), RSI ${rsi14.toFixed(1)} <= ${MEAN_REVERSION_RSI_OVERSOLD}, volume spike, near support ${support.toFixed(4)}.`;
+            reasoning = `Mean-reversion dip: -${priceDrop.toFixed(4)} drop (>=${MEAN_REVERSION_ATR_MULTIPLE}x ATR ${atr1h.toFixed(4)}), RSI ${rsi14.toFixed(1)} <= ${MEAN_REVERSION_RSI_OVERSOLD}, volume spike, near support ${support.toFixed(4)}.`;
           }
         }
 
@@ -509,6 +514,37 @@ module.exports = async function handler(req, res) {
             reasoning: `No entry condition met. ${diagnostics}`,
           });
           continue;
+        }
+
+        // Anti-churn check: look up the last successful sell of this coin.
+        const { data: lastSells } = await supabase
+          .from("trading_log")
+          .select("price, created_at")
+          .eq("product_id", pos.product_id)
+          .eq("action", "SELL")
+          .eq("status", "success")
+          .order("created_at", { ascending: false })
+          .limit(1);
+        const lastSell = lastSells && lastSells[0];
+        if (lastSell) {
+          const hoursSinceSell = (Date.now() - new Date(lastSell.created_at).getTime()) / 3600000;
+          const lastSellPrice = parseFloat(lastSell.price);
+          let churnBlock = null;
+          if (hoursSinceSell < REBUY_BLOCK_HOURS) {
+            churnBlock = `sold ${hoursSinceSell.toFixed(1)}h ago — no rebuy within ${REBUY_BLOCK_HOURS}h of a sell`;
+          } else if (hoursSinceSell < REBUY_BELOW_SELL_HOURS && price > lastSellPrice) {
+            churnBlock = `price ${price} is above last sell price ${lastSellPrice} (${hoursSinceSell.toFixed(1)}h ago) — within ${REBUY_BELOW_SELL_HOURS}h only rebuy at or below the sell price`;
+          }
+          if (churnBlock) {
+            await logAndPush({
+              action: "SKIP",
+              status: "skipped",
+              price,
+              regime,
+              reasoning: `Buy signal ignored (anti-churn): ${churnBlock}. Signal was: ${reasoning}`,
+            });
+            continue;
+          }
         }
 
         const stopDistancePct =
@@ -526,7 +562,7 @@ module.exports = async function handler(req, res) {
             status: "skipped",
             price,
             regime,
-            reasoning: `Position size after ${(capPct * 100).toFixed(0)}% pool cap and risk sizing rounds to under £1 (pool £${sharedCash.toFixed(2)}) — skipping.`,
+            reasoning: `Position size after ${(capPct * 100).toFixed(0)}% pool cap and risk sizing is under the £${MIN_TRADE_SIZE_GBP} minimum (pool £${sharedCash.toFixed(2)}) — skipping.`,
           });
           continue;
         }
