@@ -58,3 +58,7 @@ alter table risk_state enable row level security;
 create policy "Allow public read on trading_positions" on trading_positions for select using (true);
 create policy "Allow public read on trading_log" on trading_log for select using (true);
 create policy "Allow public read on risk_state" on risk_state for select using (true);
+
+-- Nov 2026: wider, volatility-based stop-loss. Set once per entry by the bot
+-- (5x hourly ATR, clamped 4-10% below entry); null until the next check.
+alter table trading_positions add column if not exists stop_price numeric;

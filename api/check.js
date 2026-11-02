@@ -52,9 +52,46 @@ const MIN_TRADE_SIZE_GBP = 3; // skip trades this small — fees take too large 
 const POOL_CAP_PCT = { "BTC-GBP": 0.30, "ETH-GBP": 0.30, "ADA-GBP": 0.30 };
 const POOL_CAP_PCT_DEFAULT = 0.10;
 const DAILY_LOSS_LIMIT_PCT = 0.05; // 5%
-const MOMENTUM_TRAILING_STOP_PCT = 0.025; // 2.5%
+const MOMENTUM_TRAILING_STOP_PCT = 0.025; // 2.5% below peak — profit-taking trigger only, never a full exit
 const MEAN_REVERSION_TAKE_PROFIT_PCT = 0.04; // midpoint of 3-5%
-const MEAN_REVERSION_STOP_LOSS_PCT = 0.025; // 2-3% band, using 2.5%
+
+// Wider, volatility-based stop-loss (Nov 2026). Replaces the fixed 2.5% stop,
+// which sold BTC/ETH/ADA on ordinary dips that then recovered.
+//  - Each position's stop is set from the coin's normal swing size:
+//    5x the hourly ATR (roughly one day's typical move), kept between 4% and
+//    10% below entry. It's saved once in trading_positions.stop_price so it
+//    doesn't drift afterwards (reset whenever the entry price changes).
+//  - It only fires once a completed hourly candle closes below the stop AND
+//    the price is still below it — a brief dip/wick doesn't trigger a sale.
+//  - Crash guard: if the price falls 1.5x the stop distance below entry, the
+//    bot sells immediately without waiting for the hourly close.
+const STOP_ATR_MULTIPLE = 5;
+const STOP_MIN_PCT = 0.04;
+const STOP_MAX_PCT = 0.10;
+const STOP_FALLBACK_PCT = 0.06; // used when there's too little price history to measure swings
+const STOP_EMERGENCY_MULTIPLE = 1.5;
+// If a thinly traded coin has no completed candle in this long, the live
+// price alone confirms the stop (there's no fresh hourly close to wait for).
+const STALE_CANDLE_MS = 2 * 3600 * 1000;
+// Buy and profit-taking signals need this much hourly history. Stop-losses
+// are checked on held coins even when there's less (the XTZ gap, Nov 2026).
+const MIN_CANDLES_FOR_SIGNALS = 60;
+
+function stopPctFor(atr1h, price) {
+  if (!atr1h || !price) return STOP_FALLBACK_PCT;
+  return Math.min(STOP_MAX_PCT, Math.max(STOP_MIN_PCT, (STOP_ATR_MULTIPLE * atr1h) / price));
+}
+
+// Coinbase includes the current, still-forming hour as the newest candle.
+// Return the newest candle whose hour has fully finished.
+function lastCompletedCandle(candles, nowMs) {
+  for (let i = candles.length - 1; i >= 0; i--) {
+    if ((candles[i].time + 3600) * 1000 <= nowMs) return candles[i];
+  }
+  return null;
+}
+
+const fmt = (n) => (n === null || n === undefined ? "n/a" : String(+Number(n).toPrecision(6)));
 
 // Entry-condition thresholds — back to the ORIGINAL stricter spec (Oct 2026).
 // The loosened versions (0.6x ATR, 1.2x volume, etc.) produced more trades,
@@ -198,6 +235,8 @@ module.exports = async function handler(req, res) {
                 peak_price: newPeak,
                 last_regime: newRegime,
                 last_trade_at: nowIso,
+                // Entry changed — the stop is recalculated later this run.
+                stop_price: null,
               };
               await logAndPush({
                 action: "BUY",
@@ -235,6 +274,7 @@ module.exports = async function handler(req, res) {
                 entry_price: stillHolding ? pos.entry_price : null,
                 // Trailing stop measures the next climb from here.
                 peak_price: stillHolding ? avgPrice : null,
+                stop_price: stillHolding ? pos.stop_price : null,
                 last_trade_at: nowIso,
               };
               await logAndPush({
@@ -319,9 +359,11 @@ module.exports = async function handler(req, res) {
             // the current price as a starting reference point.
             pos.entry_price = price;
             pos.peak_price = price;
+            pos.stop_price = null; // recalculated from the new entry below
           } else if (actualBalance <= 0) {
             pos.entry_price = null;
             pos.peak_price = null;
+            pos.stop_price = null;
           }
 
           await supabase
@@ -331,6 +373,7 @@ module.exports = async function handler(req, res) {
               in_position: pos.in_position,
               entry_price: pos.entry_price,
               peak_price: pos.peak_price,
+              stop_price: pos.stop_price ?? null,
             })
             .eq("product_id", pos.product_id);
 
@@ -352,11 +395,23 @@ module.exports = async function handler(req, res) {
           candleCount: 210,
         });
 
-        if (candles.length < 60) {
+        // Thinly traded coins (e.g. XTZ) can return too few hourly candles
+        // for buy/profit signals. Previously the bot then skipped the coin
+        // entirely — including its stop-loss — so a held coin went
+        // unprotected. Now: not held → skip as before; held → still check
+        // the stop-loss (buy and profit-taking checks are skipped).
+        const thinHistory = candles.length < MIN_CANDLES_FOR_SIGNALS;
+        const holdsCoin = (pos.base_size || 0) * price > DUST_THRESHOLD_GBP;
+        if (thinHistory && !holdsCoin) {
+          await supabase
+            .from("trading_positions")
+            .update({ last_checked_at: new Date().toISOString(), last_checked_price: price })
+            .eq("product_id", pos.product_id);
           await logAndPush({
             action: "SKIP",
             status: "skipped",
             price,
+            reasoning: `Only ${candles.length} hourly candles available (need ${MIN_CANDLES_FOR_SIGNALS}) — no buy checks this run.`,
             detail: "Not enough candle history yet for reliable indicators.",
           });
           continue;
@@ -366,16 +421,17 @@ module.exports = async function handler(req, res) {
         const ma200 = sma(candles, Math.min(200, candles.length));
         const ma50Rising = isMovingAverageRising(candles, 50);
         const rsi14 = rsi(candles, 14);
-        const atr1h = atr(candles, 14);
+        const atr1h = atr(candles, 14); // needs only 15 candles, so usually available even when thin
         const avgVol = averageVolume(candles, 20);
         const resistance = recentResistance(candles, 20);
         const support = recentSupport(candles, 20);
-        const lastCandle = candles[candles.length - 1];
-        const prevCandle = candles[candles.length - 2];
-        const currentVolume = lastCandle.volume;
+        const lastCandle = candles[candles.length - 1] || null;
+        const prevCandle = candles[candles.length - 2] || null;
+        const currentVolume = lastCandle ? lastCandle.volume : 0;
 
-        const regime =
-          ma200 !== null && price > ma200 && ma50Rising && ma50 > ma200
+        const regime = thinHistory
+          ? pos.last_regime || "MEAN_REVERSION"
+          : ma200 !== null && price > ma200 && ma50Rising && ma50 > ma200
             ? "MOMENTUM"
             : "MEAN_REVERSION";
 
@@ -434,35 +490,73 @@ module.exports = async function handler(req, res) {
           // profit-taking signal. Only the former should ever close the
           // whole position — profit-taking signals just skim the gain.
           let isProtectiveExit = false;
+          let stopNote = "";
 
-          if (pos.last_regime === "MOMENTUM") {
-            const stopPrice = newPeak * (1 - MOMENTUM_TRAILING_STOP_PCT);
-            const momentumWeakening = rsi14 >= 75 && price < prevCandle.close;
-            const hardStopPrice = pos.entry_price * (1 - MOMENTUM_TRAILING_STOP_PCT);
-            if (price <= hardStopPrice) {
+          // ---- Protective stop-loss (both regimes) ----
+          // Set this position's stop once: after a new buy, a manual buy the
+          // bot picked up, or for positions opened before Nov 2026.
+          if (!pos.stop_price && pos.entry_price) {
+            const pct = stopPctFor(atr1h, price);
+            pos.stop_price = pos.entry_price * (1 - pct);
+            await supabase
+              .from("trading_positions")
+              .update({ stop_price: pos.stop_price })
+              .eq("product_id", pos.product_id);
+            await logAndPush({
+              action: "STOP_SET",
+              status: "success",
+              price,
+              regime: pos.last_regime,
+              reasoning: `Stop-loss set at ${fmt(pos.stop_price)}: ${(pct * 100).toFixed(1)}% below entry ${fmt(pos.entry_price)} (${atr1h ? `5x hourly swing of ${fmt(atr1h)}, kept within ${STOP_MIN_PCT * 100}–${STOP_MAX_PCT * 100}%` : `fallback ${STOP_FALLBACK_PCT * 100}% — not enough history to measure swings`}). Crash guard at ${fmt(pos.entry_price - STOP_EMERGENCY_MULTIPLE * (pos.entry_price - pos.stop_price))}.`,
+            });
+          }
+
+          if (pos.stop_price && pos.entry_price) {
+            const stopPrice = pos.stop_price;
+            const stopPctBelow = ((pos.entry_price - stopPrice) / pos.entry_price) * 100;
+            const crashPrice = pos.entry_price - STOP_EMERGENCY_MULTIPLE * (pos.entry_price - stopPrice);
+            const nowMs = Date.now();
+            const closed = lastCompletedCandle(candles, nowMs);
+            const closedIsStale = !closed || nowMs - (closed.time + 3600) * 1000 > STALE_CANDLE_MS;
+
+            if (price <= crashPrice) {
               shouldSell = true;
               isProtectiveExit = true;
-              reasoning = `Stop-loss: price ${price} fell ${(MOMENTUM_TRAILING_STOP_PCT * 100).toFixed(1)}% below original entry ${pos.entry_price} — closing to protect capital.`;
+              reasoning = `Crash guard: price ${price} is ${(((pos.entry_price - price) / pos.entry_price) * 100).toFixed(1)}% below entry ${fmt(pos.entry_price)} (past ${fmt(crashPrice)}) — selling now without waiting for the hourly close.`;
+            } else if (price <= stopPrice && (closedIsStale || closed.close <= stopPrice)) {
+              shouldSell = true;
+              isProtectiveExit = true;
+              reasoning = closedIsStale
+                ? `Stop-loss: price ${price} <= stop ${fmt(stopPrice)} (${stopPctBelow.toFixed(1)}% below entry ${fmt(pos.entry_price)}); no recent hourly candle for this thinly traded coin, so the live price confirms it — closing to protect capital.`
+                : `Stop-loss: hourly candle closed at ${closed.close} <= stop ${fmt(stopPrice)} (${stopPctBelow.toFixed(1)}% below entry ${fmt(pos.entry_price)}) and price ${price} is still below — closing to protect capital.`;
             } else if (price <= stopPrice) {
-              shouldSell = true;
-              reasoning = `Momentum trailing stop: price ${price} <= ${stopPrice.toFixed(4)} (2.5% below peak ${newPeak}) — taking profit, keeping principal.`;
-            } else if (momentumWeakening) {
-              shouldSell = true;
-              reasoning = `RSI overbought (${rsi14.toFixed(1)}) and price weakening — taking profit, keeping principal.`;
+              stopNote = ` Price ${price} is below the stop ${fmt(stopPrice)} — waiting for an hourly close below it before selling.`;
+            } else {
+              stopNote = ` Stop ${fmt(stopPrice)}.`;
             }
-          } else {
-            const takeProfitPrice = pos.entry_price * (1 + MEAN_REVERSION_TAKE_PROFIT_PCT);
-            const stopLossPrice = pos.entry_price * (1 - MEAN_REVERSION_STOP_LOSS_PCT);
-            if (price <= stopLossPrice) {
-              shouldSell = true;
-              isProtectiveExit = true;
-              reasoning = `Stop-loss hit: price ${price} <= ${stopLossPrice.toFixed(4)} — closing to protect capital.`;
-            } else if (price >= takeProfitPrice) {
-              shouldSell = true;
-              reasoning = `Take-profit hit: price ${price} >= ${takeProfitPrice.toFixed(4)} (+${(MEAN_REVERSION_TAKE_PROFIT_PCT * 100).toFixed(1)}% from entry) — taking profit, keeping principal.`;
-            } else if (rsi14 >= 60) {
-              shouldSell = true;
-              reasoning = `RSI back to neutral/overbought (${rsi14.toFixed(1)}) — taking profit, keeping principal.`;
+          }
+
+          // ---- Profit-taking signals (need full price history) ----
+          if (!shouldSell && !thinHistory) {
+            if (pos.last_regime === "MOMENTUM") {
+              const trailPrice = newPeak * (1 - MOMENTUM_TRAILING_STOP_PCT);
+              const momentumWeakening = rsi14 >= 75 && prevCandle && price < prevCandle.close;
+              if (price <= trailPrice) {
+                shouldSell = true;
+                reasoning = `Momentum trailing stop: price ${price} <= ${trailPrice.toFixed(4)} (2.5% below peak ${newPeak}) — taking profit, keeping principal.`;
+              } else if (momentumWeakening) {
+                shouldSell = true;
+                reasoning = `RSI overbought (${rsi14.toFixed(1)}) and price weakening — taking profit, keeping principal.`;
+              }
+            } else {
+              const takeProfitPrice = pos.entry_price * (1 + MEAN_REVERSION_TAKE_PROFIT_PCT);
+              if (price >= takeProfitPrice) {
+                shouldSell = true;
+                reasoning = `Take-profit hit: price ${price} >= ${takeProfitPrice.toFixed(4)} (+${(MEAN_REVERSION_TAKE_PROFIT_PCT * 100).toFixed(1)}% from entry) — taking profit, keeping principal.`;
+              } else if (rsi14 !== null && rsi14 >= 60) {
+                shouldSell = true;
+                reasoning = `RSI back to neutral/overbought (${rsi14.toFixed(1)}) — taking profit, keeping principal.`;
+              }
             }
           }
 
@@ -494,7 +588,9 @@ module.exports = async function handler(req, res) {
               status: "skipped",
               price,
               regime: pos.last_regime,
-              reasoning: "No exit condition met.",
+              reasoning: thinHistory
+                ? `No exit condition met.${stopNote} (Only ${candles.length} hourly candles — stop-loss checked, profit-taking and buys skipped.)`
+                : `No exit condition met.${stopNote}`,
             });
           } else if (!isProtectiveExit && hadPendingOrder) {
             // A limit order for this coin is open or only just finished —
@@ -575,6 +671,7 @@ module.exports = async function handler(req, res) {
                     in_position: stillHolding,
                     entry_price: stillHolding ? pos.entry_price : null,
                     peak_price: stillHolding ? price : null,
+                    stop_price: stillHolding ? pos.stop_price : null,
                     last_trade_at: new Date().toISOString(),
                   })
                   .eq("product_id", pos.product_id);
@@ -582,6 +679,7 @@ module.exports = async function handler(req, res) {
 
                 pos.base_size = stillHolding ? remainingBaseSize : 0;
                 pos.in_position = stillHolding;
+                if (!stillHolding) pos.stop_price = null;
 
                 await logAndPush({
                   action: "SELL",
@@ -699,6 +797,11 @@ module.exports = async function handler(req, res) {
         if (sellExecutedThisCycle) {
           continue;
         }
+        // Too little price history for buy signals — the stop-loss check
+        // above was all this coin needed this run.
+        if (thinHistory) {
+          continue;
+        }
         if (hadPendingOrder) {
           await logAndPush({
             action: "SKIP",
@@ -813,8 +916,8 @@ module.exports = async function handler(req, res) {
           }
         }
 
-        const stopDistancePct =
-          regime === "MOMENTUM" ? MOMENTUM_TRAILING_STOP_PCT : MEAN_REVERSION_STOP_LOSS_PCT;
+        // Size against the same stop distance this position will get.
+        const stopDistancePct = stopPctFor(atr1h, price);
         const maxRiskGbp = RISK_PER_TRADE_PCT * totalCapitalNow;
         const riskBasedSizeGbp = stopDistancePct > 0 ? maxRiskGbp / stopDistancePct : sharedCash;
         // Per-coin cap on the shared pool: 30% for main coins, 10% otherwise.

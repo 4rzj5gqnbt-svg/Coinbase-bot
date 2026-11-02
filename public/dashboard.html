@@ -288,7 +288,7 @@
     const { data, error } = await client
       .from("trading_log")
       .select("*")
-      .in("action", ["BUY", "SELL", "RECONCILE"]) // hide the noisy HOLD/SKIP rows from the main view
+      .in("action", ["BUY", "SELL", "RECONCILE", "STOP_SET"]) // hide the noisy HOLD/SKIP rows from the main view
       .order("created_at", { ascending: false })
       .limit(100);
 
