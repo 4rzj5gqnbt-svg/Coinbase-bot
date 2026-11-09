@@ -43,14 +43,35 @@ const TERMINAL_ORDER_STATUSES = ["FILLED", "CANCELLED", "EXPIRED", "FAILED"];
 // Holdings worth less than this are treated as leftover dust, not a position.
 const DUST_THRESHOLD_GBP = 0.05;
 const MIN_PROFIT_AFTER_FEES_PCT = 0.03; // require >=3% gain before taking profit (covers the real ~2.4% round-trip fee plus a margin)
-const MIN_TRADE_SIZE_GBP = 3; // skip trades this small — fees take too large a bite proportionally
+const MIN_TRADE_SIZE_GBP = 3; // minimum size for a new BUY
+
+// Profit-taking (Nov 2026, change A). Previously the bot sold only the gain
+// and only if that gain was worth £3+ — with £4–£22 holdings that almost never
+// happened, so XTZ (+19%) and ADA (+7%) gave all their gains back. Now, the
+// first time a profit-taking signal fires on a position, the bot sells HALF
+// the coins. Coinbase fees are a percentage, so small sells are fine down to
+// MIN_SELL_SIZE_GBP (or Coinbase's own minimum for the coin, if higher).
+// After that, the remaining half is managed by the locked-in stop (change C).
+const PROFIT_TAKE_FRACTION = 0.5;
+const MIN_SELL_SIZE_GBP = 1;
 
 // Shared cash pool model: one pot of GBP (stored in risk_state.shared_cash_gbp)
-// funds buys of ANY coin, and profit-skims flow back into it. To avoid the
-// pool being drained into a single coin, each buy is capped to a fraction of
-// the *current* pool: 30% for the main coins, 10% for everything else.
-const POOL_CAP_PCT = { "BTC-GBP": 0.30, "ETH-GBP": 0.30, "ADA-GBP": 0.30 };
-const POOL_CAP_PCT_DEFAULT = 0.10;
+// funds buys of ANY coin, and profit-skims flow back into it.
+// Change B (Nov 2026): one buy per coin until it's sold (no averaging down —
+// ADA was bought 3 times on the way down and grew to over half the bot), and
+// each buy is capped to a share of the WHOLE bot (cash + coins), not of
+// whatever cash happens to be left: 30% for the main coins, 10% otherwise.
+const COIN_CAP_PCT = { "BTC-GBP": 0.30, "ETH-GBP": 0.30, "ADA-GBP": 0.30 };
+const COIN_CAP_PCT_DEFAULT = 0.10;
+
+// Change C (Nov 2026): lock in gains. Once a coin is LOCK_TRIGGER_PCT above
+// its buy price (or after half has been sold for profit), its stop moves up
+// to LOCK_FLOOR_PCT above the buy price — enough to roughly cover the buy and
+// sell fees — and from then on follows the price up (same swing-based
+// distance as the normal stop), never down.
+const LOCK_TRIGGER_PCT = 0.05;
+const LOCK_FLOOR_PCT = 0.02;
+const LOCK_MIN_RAISE_PCT = 0.005; // only move the stop when it rises by 0.5%+ (avoids hourly noise)
 const DAILY_LOSS_LIMIT_PCT = 0.05; // 5%
 const MOMENTUM_TRAILING_STOP_PCT = 0.025; // 2.5% below peak — profit-taking trigger only, never a full exit
 const MEAN_REVERSION_TAKE_PROFIT_PCT = 0.04; // midpoint of 3-5%
@@ -274,7 +295,11 @@ module.exports = async function handler(req, res) {
                 entry_price: stillHolding ? pos.entry_price : null,
                 // Trailing stop measures the next climb from here.
                 peak_price: stillHolding ? avgPrice : null,
-                stop_price: stillHolding ? pos.stop_price : null,
+                // Change C: after taking profit, the rest can't turn into a
+                // loss — the stop is lifted to at least just above the buy price.
+                stop_price: stillHolding
+                  ? Math.max(pos.stop_price || 0, pos.entry_price * (1 + LOCK_FLOOR_PCT))
+                  : null,
                 last_trade_at: nowIso,
               };
               await logAndPush({
@@ -511,10 +536,47 @@ module.exports = async function handler(req, res) {
             });
           }
 
+          // ---- Change C: lock in gains ----
+          // Once the coin is 5%+ above the buy price (or the stop is already
+          // locked above it), lift the stop to at least 2% above the buy price
+          // and let it follow the price up — never down.
+          if (pos.stop_price && pos.entry_price) {
+            const alreadyLocked = pos.stop_price >= pos.entry_price;
+            const gainNow = (price - pos.entry_price) / pos.entry_price;
+            if (alreadyLocked || gainNow >= LOCK_TRIGGER_PCT) {
+              const trailPct = stopPctFor(atr1h, price);
+              const candidate = Math.max(pos.entry_price * (1 + LOCK_FLOOR_PCT), price * (1 - trailPct));
+              if (candidate > pos.stop_price * (1 + LOCK_MIN_RAISE_PCT) && candidate < price) {
+                const oldStop = pos.stop_price;
+                pos.stop_price = candidate;
+                await supabase
+                  .from("trading_positions")
+                  .update({ stop_price: pos.stop_price })
+                  .eq("product_id", pos.product_id);
+                await logAndPush({
+                  action: "STOP_SET",
+                  status: "success",
+                  price,
+                  regime: pos.last_regime,
+                  reasoning: `Stop raised to lock in gains: ${fmt(oldStop)} → ${fmt(pos.stop_price)} (price ${price} is ${(gainNow * 100).toFixed(1)}% above entry ${fmt(pos.entry_price)}; stop never goes below ${LOCK_FLOOR_PCT * 100}% above entry, then follows the price up ${(trailPct * 100).toFixed(1)}% behind).`,
+                });
+              }
+            }
+          }
+
           if (pos.stop_price && pos.entry_price) {
             const stopPrice = pos.stop_price;
             const stopPctBelow = ((pos.entry_price - stopPrice) / pos.entry_price) * 100;
-            const crashPrice = pos.entry_price - STOP_EMERGENCY_MULTIPLE * (pos.entry_price - stopPrice);
+            const lockedGain = stopPrice >= pos.entry_price;
+            // Crash guard sits half a stop-distance below the stop. For a
+            // normal stop that's the same as before (1.5x the distance below
+            // entry); for a locked-in stop the distance is the coin's swing size.
+            const crashPrice = lockedGain
+              ? stopPrice * (1 - (STOP_EMERGENCY_MULTIPLE - 1) * stopPctFor(atr1h, price))
+              : pos.entry_price - STOP_EMERGENCY_MULTIPLE * (pos.entry_price - stopPrice);
+            const stopDesc = lockedGain
+              ? `locked-in stop ${fmt(stopPrice)}, ${(-stopPctBelow).toFixed(1)}% above entry ${fmt(pos.entry_price)}`
+              : `stop ${fmt(stopPrice)}, ${stopPctBelow.toFixed(1)}% below entry ${fmt(pos.entry_price)}`;
             const nowMs = Date.now();
             const closed = lastCompletedCandle(candles, nowMs);
             const closedIsStale = !closed || nowMs - (closed.time + 3600) * 1000 > STALE_CANDLE_MS;
@@ -522,13 +584,14 @@ module.exports = async function handler(req, res) {
             if (price <= crashPrice) {
               shouldSell = true;
               isProtectiveExit = true;
-              reasoning = `Crash guard: price ${price} is ${(((pos.entry_price - price) / pos.entry_price) * 100).toFixed(1)}% below entry ${fmt(pos.entry_price)} (past ${fmt(crashPrice)}) — selling now without waiting for the hourly close.`;
+              reasoning = `Crash guard: price ${price} fell past ${fmt(crashPrice)} (${stopDesc}) — selling now without waiting for the hourly close.`;
             } else if (price <= stopPrice && (closedIsStale || closed.close <= stopPrice)) {
               shouldSell = true;
               isProtectiveExit = true;
+              const why = lockedGain ? "selling to keep the gain" : "closing to protect capital";
               reasoning = closedIsStale
-                ? `Stop-loss: price ${price} <= stop ${fmt(stopPrice)} (${stopPctBelow.toFixed(1)}% below entry ${fmt(pos.entry_price)}); no recent hourly candle for this thinly traded coin, so the live price confirms it — closing to protect capital.`
-                : `Stop-loss: hourly candle closed at ${closed.close} <= stop ${fmt(stopPrice)} (${stopPctBelow.toFixed(1)}% below entry ${fmt(pos.entry_price)}) and price ${price} is still below — closing to protect capital.`;
+                ? `Stop-loss: price ${price} <= ${stopDesc}; no recent hourly candle for this thinly traded coin, so the live price confirms it — ${why}.`
+                : `Stop-loss: hourly candle closed at ${closed.close} <= ${stopDesc}, and price ${price} is still below — ${why}.`;
             } else if (price <= stopPrice) {
               stopNote = ` Price ${price} is below the stop ${fmt(stopPrice)} — waiting for an hourly close below it before selling.`;
             } else {
@@ -537,7 +600,22 @@ module.exports = async function handler(req, res) {
           }
 
           // ---- Profit-taking signals (need full price history) ----
+          // Change A: half is sold the first time; after that the remaining
+          // half rides the locked-in stop instead of being sold off in slices.
+          // "First time" = no successful sell of this coin since its last buy.
+          let profitAlreadyTaken = false;
           if (!shouldSell && !thinHistory) {
+            const { data: lastTrades } = await supabase
+              .from("trading_log")
+              .select("action")
+              .eq("product_id", pos.product_id)
+              .in("action", ["BUY", "SELL"])
+              .eq("status", "success")
+              .order("created_at", { ascending: false })
+              .limit(1);
+            profitAlreadyTaken = !!(lastTrades && lastTrades[0] && lastTrades[0].action === "SELL");
+          }
+          if (!shouldSell && !thinHistory && !profitAlreadyTaken) {
             if (pos.last_regime === "MOMENTUM") {
               const trailPrice = newPeak * (1 - MOMENTUM_TRAILING_STOP_PCT);
               const momentumWeakening = rsi14 >= 75 && prevCandle && price < prevCandle.close;
@@ -590,7 +668,9 @@ module.exports = async function handler(req, res) {
               regime: pos.last_regime,
               reasoning: thinHistory
                 ? `No exit condition met.${stopNote} (Only ${candles.length} hourly candles — stop-loss checked, profit-taking and buys skipped.)`
-                : `No exit condition met.${stopNote}`,
+                : profitAlreadyTaken
+                  ? `No exit condition met.${stopNote} (Half already sold for profit — the rest exits via the locked-in stop.)`
+                  : `No exit condition met.${stopNote}`,
             });
           } else if (!isProtectiveExit && hadPendingOrder) {
             // A limit order for this coin is open or only just finished —
@@ -697,21 +777,25 @@ module.exports = async function handler(req, res) {
             }
           } else {
             // ---------- PROFIT-TAKING: post-only LIMIT order (maker fee) ----------
-            // Skim only the gain, keep the principal invested.
+            // Change A: sell half the position (once); the rest stays invested
+            // behind a locked-in stop.
             const product = await getProduct(pos.product_id);
             const baseIncrement = parseFloat(product.base_increment);
             const priceIncrement = parseFloat(product.price_increment || product.quote_increment);
             const baseMin = parseFloat(product.base_min_size || 0);
-            const profitGbp = pos.base_size * Math.max(0, price - pos.entry_price);
-            const sellBaseSize = roundToIncrement(Math.min(profitGbp / price, actualBalance), baseIncrement);
+            const minSellGbp = Math.max(MIN_SELL_SIZE_GBP, parseFloat(product.quote_min_size || 0));
+            const sellBaseSize = roundToIncrement(
+              Math.min(pos.base_size * PROFIT_TAKE_FRACTION, actualBalance),
+              baseIncrement
+            );
 
-            if (sellBaseSize * price < MIN_TRADE_SIZE_GBP) {
+            if (sellBaseSize * price < minSellGbp) {
               await logAndPush({
                 action: "SELL",
                 status: "skipped",
                 price,
                 regime: pos.last_regime,
-                reasoning: `${reasoning} [profit portion (£${(sellBaseSize * price).toFixed(2)}) is below the £${MIN_TRADE_SIZE_GBP} minimum trade size — holding for a bigger skim instead]`,
+                reasoning: `${reasoning} [half the holding (£${(sellBaseSize * price).toFixed(2)}) is below the £${minSellGbp.toFixed(2)} minimum sell size — holding]`,
               });
             } else if (sellBaseSize <= 0 || sellBaseSize < baseMin) {
               await logAndPush({
@@ -719,7 +803,7 @@ module.exports = async function handler(req, res) {
                 status: "skipped",
                 price,
                 regime: pos.last_regime,
-                reasoning: `${reasoning} [profit portion is below Coinbase's minimum order size for this coin — nothing to sell yet]`,
+                reasoning: `${reasoning} [half the holding is below Coinbase's minimum order size for this coin — holding]`,
               });
             } else {
               // Sit at the best ask (the lowest current seller) so the order
@@ -741,7 +825,7 @@ module.exports = async function handler(req, res) {
                   status: "error",
                   price,
                   regime: pos.last_regime,
-                  reasoning: `${reasoning} [profit skim, limit order]`,
+                  reasoning: `${reasoning} [profit-take (half), limit order]`,
                   detail: `Limit order rejected by Coinbase, position left unchanged: ${JSON.stringify(order.error_response || order)}`,
                 });
               } else {
@@ -753,7 +837,7 @@ module.exports = async function handler(req, res) {
                   pending_limit_price: limitPrice,
                   pending_quote_gbp: 0,
                   pending_placed_at: new Date().toISOString(),
-                  pending_reasoning: `${reasoning} [partial (profit only, principal kept invested)]`,
+                  pending_reasoning: `${reasoning} [profit-take: selling half, the rest stays invested behind a locked-in stop]`,
                   pending_regime: pos.last_regime,
                 };
                 // If the bot can't record the order, cancel it — an order the
@@ -790,12 +874,14 @@ module.exports = async function handler(req, res) {
         }
 
         // ============= CHECK BUY CONDITIONS =============
-        // Runs regardless of whether we already hold some of this coin —
-        // averaging into an existing holding on a dip is fine. Skipped only
-        // if we just sold this same coin this cycle (avoid buying straight
-        // back into what we just sold in the same run).
+        // Change B: one buy per coin until it's sold — no adding to a coin
+        // already held (averaging down). Also skipped if we just sold this
+        // same coin this cycle.
         if (sellExecutedThisCycle) {
           continue;
+        }
+        if (hasMeaningfulHolding && pos.base_size > 0) {
+          continue; // already holding — the HOLD row above covers this run
         }
         // Too little price history for buy signals — the stop-loss check
         // above was all this coin needed this run.
@@ -920,9 +1006,10 @@ module.exports = async function handler(req, res) {
         const stopDistancePct = stopPctFor(atr1h, price);
         const maxRiskGbp = RISK_PER_TRADE_PCT * totalCapitalNow;
         const riskBasedSizeGbp = stopDistancePct > 0 ? maxRiskGbp / stopDistancePct : sharedCash;
-        // Per-coin cap on the shared pool: 30% for main coins, 10% otherwise.
-        const capPct = POOL_CAP_PCT[pos.product_id] || POOL_CAP_PCT_DEFAULT;
-        const capGbp = sharedCash * capPct;
+        // Change B: per-coin cap as a share of the WHOLE bot (cash + coins):
+        // 30% for main coins, 10% otherwise.
+        const capPct = COIN_CAP_PCT[pos.product_id] || COIN_CAP_PCT_DEFAULT;
+        const capGbp = totalCapitalNow * capPct;
         const spendGbp = Math.min(sharedCash, riskBasedSizeGbp, capGbp);
 
         if (spendGbp < MIN_TRADE_SIZE_GBP) {
@@ -931,7 +1018,7 @@ module.exports = async function handler(req, res) {
             status: "skipped",
             price,
             regime,
-            reasoning: `Position size after ${(capPct * 100).toFixed(0)}% pool cap and risk sizing is under the £${MIN_TRADE_SIZE_GBP} minimum (pool £${sharedCash.toFixed(2)}) — skipping.`,
+            reasoning: `Position size after the ${(capPct * 100).toFixed(0)}%-of-bot cap (£${capGbp.toFixed(2)}) and risk sizing is under the £${MIN_TRADE_SIZE_GBP} minimum (cash £${sharedCash.toFixed(2)}) — skipping.`,
           });
           continue;
         }
