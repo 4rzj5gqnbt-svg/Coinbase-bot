@@ -954,7 +954,23 @@ module.exports = async function handler(req, res) {
           const bigEnoughDrop = atr1h !== null && priceDrop >= MEAN_REVERSION_ATR_MULTIPLE * atr1h;
           const oversold = rsi14 !== null && rsi14 <= MEAN_REVERSION_RSI_OVERSOLD;
           diagnostics = `drop=${priceDrop.toFixed(4)} (need>=${(MEAN_REVERSION_ATR_MULTIPLE * atr1h).toFixed(4)}: ${bigEnoughDrop}), RSI=${rsi14?.toFixed(1)} (need<=${MEAN_REVERSION_RSI_OVERSOLD}: ${oversold}), volume=${currentVolume.toFixed(2)} (need>=${(MEAN_REVERSION_VOLUME_MULTIPLE * avgVol).toFixed(2)}: ${volumeSpike}), price=${price} vs support*${MEAN_REVERSION_SUPPORT_PROXIMITY}=${(support * MEAN_REVERSION_SUPPORT_PROXIMITY).toFixed(4)} (${nearSupport})`;
+          // Change D (Nov 2026): downtrend filter. Don't buy dips while the coin
+          // is in a clear downtrend — below its 200-hour average AND its
+          // 50-hour average still falling. Every dip-buy in early Nov (ADA x3,
+          // ETH) was made in a falling market and ended at a loss.
+          const inDowntrend =
+            candles.length >= 200 && ma200 !== null && price < ma200 && !ma50Rising;
           if (bigEnoughDrop && oversold && volumeSpike && nearSupport) {
+            if (inDowntrend) {
+              await logAndPush({
+                action: "SKIP",
+                status: "skipped",
+                price,
+                regime,
+                reasoning: `Dip-buy signal ignored — downtrend filter: price ${price} is below its 200-hour average ${ma200.toFixed(4)} and the 50-hour average is still falling.`,
+              });
+              continue;
+            }
             shouldBuy = true;
             reasoning = `Mean-reversion dip: -${priceDrop.toFixed(4)} drop (>=${MEAN_REVERSION_ATR_MULTIPLE}x ATR ${atr1h.toFixed(4)}), RSI ${rsi14.toFixed(1)} <= ${MEAN_REVERSION_RSI_OVERSOLD}, volume spike, near support ${support.toFixed(4)}.`;
           }
