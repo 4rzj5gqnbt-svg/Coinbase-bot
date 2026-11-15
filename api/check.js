@@ -20,6 +20,7 @@ const {
   averageVolume,
   recentResistance,
   recentSupport,
+  dailyTrend,
 } = require("../lib/indicators");
 
 const COOLDOWN_MS = 30 * 60 * 1000; // 30 minutes
@@ -125,6 +126,12 @@ const MEAN_REVERSION_ATR_MULTIPLE = 1.5; // loosened version was 0.8
 const MEAN_REVERSION_RSI_OVERSOLD = 30; // loosened version was 40
 const MEAN_REVERSION_VOLUME_MULTIPLE = 1.5; // loosened version was 1.2
 const MEAN_REVERSION_SUPPORT_PROXIMITY = 1.01; // loosened version was 1.02
+// Trend filter (Nov 2026): only buy a dip when the coin's longer-term trend is
+// up — price above its 30-day average AND that average higher than 5 days ago.
+// Every dip-buy from 24 Oct to 14 Nov (8 trades) was made in a falling market
+// and lost money; this rule would have blocked all of them.
+const TREND_FILTER_DAYS = 30;
+const TREND_FILTER_LOOKBACK_DAYS = 5;
 
 // Anti-churn rules. The bot repeatedly sold a coin and then bought it back
 // higher within a day or two (e.g. ADA sold ~0.2048 on 5 Oct, rebought 0.209
@@ -955,6 +962,32 @@ module.exports = async function handler(req, res) {
           const oversold = rsi14 !== null && rsi14 <= MEAN_REVERSION_RSI_OVERSOLD;
           diagnostics = `drop=${priceDrop.toFixed(4)} (need>=${(MEAN_REVERSION_ATR_MULTIPLE * atr1h).toFixed(4)}: ${bigEnoughDrop}), RSI=${rsi14?.toFixed(1)} (need<=${MEAN_REVERSION_RSI_OVERSOLD}: ${oversold}), volume=${currentVolume.toFixed(2)} (need>=${(MEAN_REVERSION_VOLUME_MULTIPLE * avgVol).toFixed(2)}: ${volumeSpike}), price=${price} vs support*${MEAN_REVERSION_SUPPORT_PROXIMITY}=${(support * MEAN_REVERSION_SUPPORT_PROXIMITY).toFixed(4)} (${nearSupport})`;
           if (bigEnoughDrop && oversold && volumeSpike && nearSupport) {
+            // Trend filter: fetched only when a dip signal fires, so it adds
+            // no API calls on normal hours. If the daily history can't be
+            // read, err on the side of NOT buying.
+            let trend = null;
+            try {
+              const daily = await getCandles(pos.product_id, {
+                granularity: "ONE_DAY",
+                candleCount: TREND_FILTER_DAYS + TREND_FILTER_LOOKBACK_DAYS + 5,
+              });
+              trend = dailyTrend(daily, TREND_FILTER_DAYS, TREND_FILTER_LOOKBACK_DAYS);
+            } catch (e) {
+              trend = null;
+            }
+            if (!trend || !trend.up) {
+              await logAndPush({
+                action: "SKIP",
+                status: "skipped",
+                price,
+                regime,
+                reasoning: trend
+                  ? `Dip-buy signal ignored — trend filter: longer-term trend is not up (price ${price} vs ${TREND_FILTER_DAYS}-day average ${trend.avgNow.toFixed(4)}, which was ${trend.avgBefore.toFixed(4)} ${TREND_FILTER_LOOKBACK_DAYS} days ago).`
+                  : `Dip-buy signal ignored — trend filter: couldn't read ${TREND_FILTER_DAYS}-day price history, so not buying.`,
+                detail: diagnostics,
+              });
+              continue;
+            }
             shouldBuy = true;
             reasoning = `Mean-reversion dip: -${priceDrop.toFixed(4)} drop (>=${MEAN_REVERSION_ATR_MULTIPLE}x ATR ${atr1h.toFixed(4)}), RSI ${rsi14.toFixed(1)} <= ${MEAN_REVERSION_RSI_OVERSOLD}, volume spike, near support ${support.toFixed(4)}.`;
           }
